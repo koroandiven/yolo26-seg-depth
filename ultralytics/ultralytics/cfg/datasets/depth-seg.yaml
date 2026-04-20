@@ -1,0 +1,62 @@
+# YOLO26 Depth + Segmentation Dataset Configuration
+# 基于 NYU Depth V2 格式
+
+# 数据集根目录
+path: ./depth_seg_dataset
+
+# 训练集图像路径
+train: images/train
+
+# 验证集图像路径
+val: images/val
+
+# 分割标注路径 (YOLO 格式 .txt)
+mask: segments/train
+
+# 深度图路径 (16-bit PNG, 毫米为单位)
+depth: depths/train
+
+# 分割类别数
+nc: 1
+
+# 深度通道数 (单通道深度图)
+depth_nc: 1
+
+# 深度图归一化参数
+depth_max: 100.0  # 最大深度值 (米)
+
+# 类别名称 (背景 + 前景物体)
+names:
+  0: background
+  1: foreground
+
+# 数据增强
+# augmentation: true
+# hsv_h: 0.015
+# hsv_s: 0.7
+# hsv_v: 0.4
+# degrees: 0.0
+# translate: 0.1
+# scale: 0.5
+# shear: 0.0
+# perspective: 0.0
+# flipud: 0.0
+# fliplr: 0.5
+# mosaic: 1.0
+# mixup: 0.0
+# copy_paste: 0.0
+
+# 训练图像尺寸
+imgsz: 640
+
+# 批量大小
+batch: 16
+
+# 缓存模式 (ram/disk/none)
+cache: none
+
+# 工作线程数
+workers: 8
+
+# 是否使用分割 (必须为 true)
+task: segment

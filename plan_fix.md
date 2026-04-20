@@ -234,7 +234,11 @@ class MultiScaleDepthLoss(nn.Module):
 **文件**: `ultralytics/ultralytics/utils/loss.py`
 ```python
 class GradNormLoss(nn.Module):
-    """梯度归一化动态权重机制 - 自适应调整分割/深度损失权重"""
+    """梯度归一化动态权重机制 - 自适应调整分割/深度损失权重
+
+    注意: 实际使用中 GradNorm 应在 backward 后、optimizer.step() 前更新权重。
+    建议通过回调函数实现，而非在损失类内部调用 backward。
+    """
 
     def __init__(self, model, loss_names, initial_weights, alpha=1.5):
         super().__init__()
@@ -244,32 +248,47 @@ class GradNormLoss(nn.Module):
         self.alpha = alpha
         self.weights = nn.Parameter(torch.tensor(initial_weights, dtype=torch.float32))
         self.loss_funcs = nn.ModuleDict({name: None for name in loss_names})
+        self.loss_history = {name: [] for name in loss_names}
 
     def update_weights(self, losses):
-        total_loss = 0
-        for i, name in enumerate(self.loss_names):
-            total_loss += self.weights[i] * losses[name]
+        """更新任务权重（应在 backward 后调用）
 
-        # 计算梯度
-        total_loss.backward(retain_graph=True)
+        Args:
+            losses: dict {task_name: loss_value}
 
-        # 计算各任务梯度范数
-        grad_norms = []
+        Returns:
+            加权后的总损失
+        """
+        self.loss_history = {name: [] for name in self.loss_names}
+        total_loss = 0.0
+
+        # 记录损失历史用于监控
         for name in self.loss_names:
-            if hasattr(self.model, 'head'):
-                param = list(self.model.head.parameters())[0]
-            else:
-                param = list(self.model.parameters())[0]
-            grad_norm = param.grad.norm().item()
-            grad_norms.append(grad_norm)
+            self.loss_history[name].append(losses[name].item() if hasattr(losses[name], 'item') else losses[name])
 
-        # 归一化权重更新
-        with torch.no_grad():
-            avg_grad = sum(grad_norms) / len(grad_norms)
-            for i in range(len(self.weights)):
-                self.weights[i] = self.weights[i] * (grad_norms[i] / avg_grad) ** self.alpha
+        # 计算加权损失（不调用 backward，避免梯度重复计算）
+        for i, name in enumerate(self.loss_names):
+            total_loss = total_loss + self.weights[i] * losses[name]
 
         return total_loss
+
+    def compute_grad_norm(self):
+        """计算各任务梯度范数（需在 backward 后调用）"""
+        grad_norms = []
+        for name in self.loss_names:
+            param = list(self.model.parameters())[0]  # 获取首层参数
+            grad_norm = param.grad.norm().item() if param.grad is not None else 0.0
+            grad_norms.append(grad_norm)
+        return grad_norms
+
+    def step(self, losses):
+        """执行权重更新（应在 optimizer.step() 后调用）"""
+        with torch.no_grad():
+            grad_norms = self.compute_grad_norm()
+            avg_grad = sum(grad_norms) / len(grad_norms) if grad_norms else 1.0
+            for i in range(len(self.weights)):
+                self.weights[i] = self.weights[i] * (grad_norms[i] / (avg_grad + 1e-8)) ** self.alpha
+        return self.weights.detach()
 ```
 
 #### 3.7 多任务联合损失类
@@ -282,8 +301,9 @@ class DepthSegmentationLoss(v8SegmentationLoss):
         super().__init__(model)
         self.use_gradnorm = use_gradnorm
         self.depth_weight = depth_weight
-        self.depth_loss = MultiScaleDepthLoss(scales=[1.0, 0.5])
+        self.depth_loss_fn = MultiScaleDepthLoss(scales=[1.0, 0.5])
         self.bce = nn.BCEWithLogitsLoss(reduction='mean')
+        self._loss_names = ['box', 'seg', 'cls', 'dfl', 'semseg', 'depth']
 
         if use_gradnorm:
             self.gradnorm = GradNormLoss(
@@ -294,26 +314,39 @@ class DepthSegmentationLoss(v8SegmentationLoss):
             )
 
     def loss(self, preds, batch):
-        seg_loss = super().loss(preds, batch)
-        seg_loss_val = seg_loss[0]
+        """计算分割+深度联合损失
+
+        Returns:
+            tuple: (total_loss, loss_items) 其中 loss_items = [box, seg, cls, dfl, semseg, depth]
+        """
+        # 调用父类损失，返回 (total_loss, loss_items)
+        seg_loss, loss_items = super().loss(preds, batch)
+        seg_loss_val = seg_loss.sum()  # 合并为标量
 
         depth_pred = preds.get('depth')
         if depth_pred is not None:
             depth_target = batch.get('depth')
             if depth_target is not None:
-                d_loss = self.depth_loss(depth_pred, depth_target)
+                d_loss = self.depth_loss_fn(depth_pred, depth_target)
 
                 if self.use_gradnorm:
                     # 动态权重调整
                     losses = {'seg': seg_loss_val, 'depth': d_loss}
                     total_loss = self.gradnorm.update_weights(losses)
-                    return (total_loss, *seg_loss[1:])
                 else:
                     # 固定权重
                     total_loss = seg_loss_val + self.depth_weight * d_loss
-                    return (total_loss, *seg_loss[1:])
 
-        return seg_loss
+                # 拼接 loss_items: [box, seg, cls, dfl, semseg, depth]
+                depth_loss_item = d_loss.detach()
+                combined_loss_items = torch.cat([
+                    loss_items[:4],  # box, seg, cls, dfl
+                    loss_items[4:5],  # semseg
+                    depth_loss_item.unsqueeze(0)  # depth
+                ])
+                return total_loss, combined_loss_items
+
+        return seg_loss, loss_items
 ```
 
 ### Phase 3: 渐进式训练策略（三阶段训练）
@@ -325,9 +358,70 @@ class DepthSegmentationLoss(v8SegmentationLoss):
 | 阶段 2 (Epochs 51-100) | 解冻分割头，深度头持续训练 | 5e-4 | depth_weight=0.3 | 分割头微调，平衡双任务 |
 | 阶段 3 (Epochs 101-150) | 解冻主干网络，启用GradNorm | 1e-4 | 动态调整 | 联合微调，优化双任务性能 |
 
-**训练脚本实现**：`yolo26_train_depth.py`
+**渐进式冻结通过回调实现**：`yolo26_train_depth.py`
 ```python
-def parse_train_args():
+from ultralytics.models.yolo.segment import SegmentationTrainer
+from ultralytics.utils import LOGGER
+
+class ProgressiveFreezeCallback:
+    """渐进式训练冻结回调 - 在每个 epoch 开始时切换冻结策略"""
+
+    def __init__(self, freeze_depth_epochs=50, freeze_seg_epochs=50, use_gradnorm=False):
+        self.freeze_depth_epochs = freeze_depth_epochs
+        self.freeze_seg_epochs = freeze_seg_epochs
+        self.use_gradnorm = use_gradnorm
+        self.initialized = False
+
+    def on_train_epoch_start(self, trainer):
+        """在每个 epoch 开始时切换冻结策略"""
+        epoch = trainer.epoch
+        model = trainer.model
+
+        # 仅在阶段切换时打印
+        if not self.initialized or epoch in (self.freeze_depth_epochs, 
+                                              self.freeze_depth_epochs + self.freeze_seg_epochs):
+            self._update_freeze(model, epoch)
+            self._print_phase(epoch)
+
+    def _update_freeze(self, model, epoch):
+        """更新冻结策略"""
+        from ultralytics.utils.torch_utils import unwrap_model
+        model = unwrap_model(model)
+
+        if epoch < self.freeze_depth_epochs:
+            # 阶段1: 仅训练深度头
+            for name, param in model.named_parameters():
+                if 'depth' not in name:
+                    param.requires_grad = False
+        elif epoch < self.freeze_depth_epochs + self.freeze_seg_epochs:
+            # 阶段2: 解冻分割头
+            for name, param in model.named_parameters():
+                if 'depth' not in name and 'seg' not in name and 'cv4' not in name:
+                    param.requires_grad = False
+        else:
+            # 阶段3: 全解冻
+            for param in model.parameters():
+                param.requires_grad = True
+
+    def _print_phase(self, epoch):
+        """打印当前训练阶段"""
+        if epoch < self.freeze_depth_epochs:
+            phase = 1
+            lr = 1e-3
+        elif epoch < self.freeze_depth_epochs + self.freeze_seg_epochs:
+            phase = 2
+            lr = 5e-4
+        else:
+            phase = 3
+            lr = 1e-4
+        LOGGER.info(f"Phase {phase}: lr={lr}, freeze_depth_epochs={self.freeze_depth_epochs}")
+
+
+def train_progressive():
+    """渐进式训练入口函数"""
+    from ultralytics import YOLO
+    import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='yolo26-seg-depth.yaml')
     parser.add_argument('--data', type=str, default='depth-seg.yaml')
@@ -337,47 +431,38 @@ def parse_train_args():
     parser.add_argument('--use-gradnorm', action='store_true')
     parser.add_argument('--freeze-depth-epochs', type=int, default=50)
     parser.add_argument('--freeze-seg-epochs', type=int, default=50)
-    return parser.parse_args()
+    parser.add_argument('--device', type=str, default='0')
+    args = parser.parse_args()
+
+    # 创建训练器（继承自 SegmentationTrainer）
+    trainer = DepthSegmentTrainer(
+        overrides={
+            'model': args.model,
+            'data': args.data,
+            'epochs': args.epochs,
+            'batch': args.batch,
+            'device': args.device,
+            'depth_weight': args.depth_weight,
+            'use_gradnorm': args.use_gradnorm,
+            'freeze_depth_epochs': args.freeze_depth_epochs,
+            'freeze_seg_epochs': args.freeze_seg_epochs,
+        }
+    )
+
+    # 注册渐进式冻结回调
+    freeze_callback = ProgressiveFreezeCallback(
+        freeze_depth_epochs=args.freeze_depth_epochs,
+        freeze_seg_epochs=args.freeze_seg_epochs,
+        use_gradnorm=args.use_gradnorm
+    )
+    trainer.add_callback('on_train_epoch_start', freeze_callback.on_train_epoch_start)
+
+    # 开始训练（损失函数通过 DepthSegmentTrainer.get_model() 自动设置）
+    trainer.train()
 
 
-def train_progressive():
-    args = parse_train_args()
-    model = YOLO(args.model)
-
-    for epoch in range(args.epochs):
-        # 阶段 1: 冻结主干和分割头，仅训练深度头
-        if epoch < args.freeze_depth_epochs:
-            for name, param in model.model.named_parameters():
-                if 'depth' not in name:
-                    param.requires_grad = False
-            optimizer = torch.optim.AdamW(
-                filter(lambda p: p.requires_grad, model.model.parameters()),
-                lr=1e-3, weight_decay=0.05
-            )
-
-        # 阶段 2: 解冻分割头，联合训练
-        elif epoch < args.freeze_depth_epochs + args.freeze_seg_epochs:
-            for name, param in model.model.named_parameters():
-                if 'depth' in name or 'seg' in name:
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
-            optimizer = torch.optim.AdamW(model.model.parameters(), lr=5e-4)
-
-        # 阶段 3: 全面微调 + GradNorm
-        else:
-            for name, param in model.model.named_parameters():
-                param.requires_grad = True
-            optimizer = torch.optim.AdamW(model.model.parameters(), lr=1e-4)
-        
-        # 单轮训练
-        model.train(
-            data=args.data,
-            epochs=1,
-            batch=args.batch,
-            optimizer=optimizer,
-            loss_fn=DepthSegmentationLoss(model, args.depth_weight, args.use_gradnorm)
-        )
+if __name__ == '__main__':
+    train_progressive()
 ```
 
 ### Phase 4: 数据集适配（深度+分割双标签）
@@ -434,44 +519,59 @@ names:
 ### Phase 5: 训练器集成与适配
 
 #### 3.11 训练器扩展（支持多任务+渐进式训练）
-**文件**: `ultralytics/ultralytics/engine/trainer.py`
+**文件**: `ultralytics/ultralytics/models/yolo/segment/train.py`（新增文件）
+
 ```python
+from ultralytics.models.yolo.segment import SegmentationTrainer
+from ultralytics.nn.tasks import SegmentationModel
+from ultralytics.utils import DEFAULT_CFG
+from ultralytics.utils.torch_utils import unwrap_model
+
+
 class DepthSegmentTrainer(SegmentationTrainer):
-    """分割+深度多任务训练器"""
+    """分割+深度多任务训练器 - 适配渐进式训练和多任务损失"""
+
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
+        if overrides is None:
+            overrides = {}
+        overrides["task"] = "segment"
         super().__init__(cfg, overrides, _callbacks)
         self.use_gradnorm = self.args.get('use_gradnorm', False)
         self.depth_weight = self.args.get('depth_weight', 0.5)
 
-    def get_loss_fn(self):
-        """加载多任务损失函数"""
-        return DepthSegmentationLoss(self.model, self.depth_weight, self.use_gradnorm)
+    def get_model(self, cfg=None, weights=None, verbose=True):
+        """初始化模型并替换为多任务损失函数"""
+        model = SegmentationModel(
+            cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose
+        )
+        if weights:
+            model.load(weights)
+        # 替换为多任务损失
+        model.criterion = DepthSegmentationLoss(
+            model, self.depth_weight, self.use_gradnorm
+        )
+        return model
 
     def build_dataset(self, img_path, mode='train', batch=None):
         """构建深度+分割数据集"""
-        return DepthSegmentDataset(
-            img_path=img_path,
-            data=self.data,
-            imgsz=self.args.imgsz,
-            augment=mode == 'train'
+        from ultralytics.data import build_yolo_dataset
+        gs = max(int(unwrap_model(self.model).stride.max()), 32)
+        return build_yolo_dataset(
+            self.args, img_path, batch, self.data, mode=mode, 
+            rect=mode == 'val', stride=gs
         )
 
-    def training_step(self, batch, batch_idx):
-        """扩展训练步骤，支持渐进式训练阶段切换"""
-        if self.epoch < self.args.freeze_depth_epochs:
-            self.model.model.requires_grad_(False)
-            for name, param in self.model.model.named_parameters():
-                if 'depth' in name:
-                    param.requires_grad = True
-        elif self.epoch < self.args.freeze_depth_epochs + self.args.freeze_seg_epochs:
-            self.model.model.requires_grad_(False)
-            for name, param in self.model.model.named_parameters():
-                if 'depth' in name or 'seg' in name:
-                    param.requires_grad = True
-        else:
-            self.model.model.requires_grad_(True)
-        return super().training_step(batch, batch_idx)
+    def get_validator(self):
+        """返回多任务验证器"""
+        from ultralytics.models.yolo.segment.val import SegmentationValidator
+        from copy import copy
+        self.loss_names = 'box_loss', 'seg_loss', 'cls_loss', 'dfl_loss', 'sem_loss', 'depth_loss'
+        return SegmentationValidator(
+            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+        )
 ```
+
+**注意**: `DepthSegmentTrainer` 应新增到 `ultralytics/models/yolo/segment/train.py` 文件末尾，继承自 `SegmentationTrainer`。
 
 ### Phase 6: 验证与推理（深度指标+多任务输出）
 

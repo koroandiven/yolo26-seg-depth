@@ -496,6 +496,19 @@ class YOLO26Inference:
             return None
         return result.masks.xyn
 
+    def get_depth(self, result: Results) -> np.ndarray | None:
+        """从结果中提取深度图
+
+        Args:
+            result: 推理结果对象
+
+        Returns:
+            np.ndarray | None: 深度图，形状为 (H, W)
+        """
+        if hasattr(result, "depth") and result.depth is not None:
+            return result.depth
+        return None
+
     def to_dict(self, result: Results) -> Dict[str, Any]:
         """将推理结果转换为字典格式
 
@@ -516,6 +529,11 @@ class YOLO26Inference:
         if self.task == "segment":
             output["masks"] = self.get_masks(result)
             output["masks_polygons"] = self.get_masks_polygons(result)
+
+        # Add depth output if available
+        depth = self.get_depth(result)
+        if depth is not None:
+            output["depth"] = depth
 
         return output
 
@@ -733,7 +751,9 @@ if __name__ == "__main__":
     infer = YOLO26Inference(args.model, device=args.device, verbose=True)
     print(infer.names)
     print(f"\n对图片进行推理: {args.source}")
-    result = infer.predict_single(args.source, conf=args.conf, verbose=True,save_path="./result.jpg")
+    result = infer.predict_single(
+        args.source, conf=args.conf, verbose=True, save_path="./result.jpg"
+    )
 
     infer.print_summary(result)
 

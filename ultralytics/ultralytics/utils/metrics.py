@@ -1553,3 +1553,32 @@ class OBBMetrics(DetMetrics):
             names (dict[int, str], optional): Dictionary of class names.
         """
         DetMetrics.__init__(self, names)
+
+
+class DepthMetric:
+    """Depth estimation evaluation metrics (AbsRel/RMSE/SILog)."""
+
+    def __init__(self):
+        self.abs_rel = []
+        self.rmse = []
+        self.silog = []
+
+    def update(self, pred, target):
+        """Update metrics."""
+        diff = pred - target
+        abs_rel = torch.mean(torch.abs(diff) / (target + 1e-8)).item()
+        rmse = torch.sqrt(torch.mean(diff.pow(2))).item()
+        log_diff = torch.log(pred + 1e-8) - torch.log(target + 1e-8)
+        silog = torch.sqrt(torch.mean(log_diff.pow(2)) - torch.mean(log_diff).pow(2)).item()
+
+        self.abs_rel.append(abs_rel)
+        self.rmse.append(rmse)
+        self.silog.append(silog)
+
+    def compute(self):
+        """Compute final metrics."""
+        return {
+            "abs_rel": np.mean(self.abs_rel) if self.abs_rel else 0.0,
+            "rmse": np.mean(self.rmse) if self.rmse else 0.0,
+            "silog": np.mean(self.silog) if self.silog else 0.0,
+        }

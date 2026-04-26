@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import SegmentationModel
-from ultralytics.utils import DEFAULT_CFG, RANK
+from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
 
 
 class SegmentationTrainer(yolo.detect.DetectionTrainer):
@@ -64,6 +64,48 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
     def get_validator(self):
         """Return an instance of SegmentationValidator for validation of YOLO model."""
         self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "sem_loss"
+        return yolo.segment.SegmentationValidator(
+            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+        )
+
+
+class DepthSegmentTrainer(SegmentationTrainer):
+    """Segmentation + Depth multi-task trainer - supports progressive training and multi-task loss."""
+
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
+        if overrides is None:
+            overrides = {}
+        overrides["task"] = "segment"
+        super().__init__(cfg, overrides, _callbacks)
+        self.use_gradnorm = getattr(self.args, "use_gradnorm", False)
+        self.depth_weight = getattr(self.args, "depth_weight", 0.5)
+
+    def get_model(self, cfg=None, weights=None, verbose=True):
+        """Initialize model and replace with multi-task loss function."""
+        model = SegmentationModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+
+        # Attach hyperparameters (required by v8DetectionLoss)
+        model.args = self.args
+
+        # Load pretrained weights if specified (from --pretrained CLI arg)
+        pretrained_path = getattr(self, "pretrained_path", None)
+        if pretrained_path and Path(pretrained_path).exists():
+            LOGGER.info(f"Loading pretrained weights from {pretrained_path}")
+            import torch
+
+            ckpt = torch.load(pretrained_path, map_location="cpu", weights_only=False)
+            model.load(ckpt, verbose=verbose)
+        elif weights:
+            model.load(weights)
+
+        from ultralytics.utils.loss import DepthSegmentationLoss
+
+        model.criterion = DepthSegmentationLoss(model, self.depth_weight, self.use_gradnorm)
+        return model
+
+    def get_validator(self):
+        """Return multi-task validator."""
+        self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "sem_loss", "depth_loss"
         return yolo.segment.SegmentationValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

@@ -1776,3 +1776,103 @@ class v10Detect(Detect):
     def fuse(self):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
+
+
+class TaskDecouplingAttention(nn.Module):
+    """Task decoupling attention module - reduces feature conflict between segmentation and depth tasks."""
+
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.seg_branch = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1),
+            nn.Sigmoid(),
+        )
+        self.depth_branch = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        seg_att = self.seg_branch(x)
+        depth_att = self.depth_branch(x)
+        return x * seg_att, x * depth_att
+
+
+class MultiScaleDepthDecoder(nn.Module):
+    """Multi-scale depth fusion decoder - FPN-style fusion of P3/P4/P5 features."""
+
+    def __init__(self, ch, c_depth=64):
+        super().__init__()
+        c3, c4, c5 = ch[0], ch[1], ch[2]  # P3/8, P4/16, P5/32
+
+        self.depth_p5 = nn.Sequential(
+            nn.Conv2d(c5, c_depth, 1),
+            nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
+        )
+        self.depth_p4 = nn.Sequential(
+            nn.Conv2d(c4, c_depth, 1),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+        )
+        self.depth_p3 = nn.Conv2d(c3, c_depth, 1)
+
+        self.fusion = nn.Sequential(
+            Conv(c_depth * 3, c_depth, k=3),
+            Conv(c_depth, c_depth // 2, k=3),
+            nn.Conv2d(c_depth // 2, 1, kernel_size=1),
+        )
+        self.depth_up = nn.Upsample(scale_factor=8, mode="bilinear", align_corners=False)
+
+    def forward(self, features):
+        p3, p4, p5 = features[0], features[1], features[2]
+
+        d_p5 = self.depth_p5(p5)
+        d_p4 = self.depth_p4(p4)
+        d_p3 = self.depth_p3(p3)
+
+        fused = torch.cat([d_p5, d_p4, d_p3], dim=1)
+        depth = self.fusion(fused)
+        depth = self.depth_up(depth)
+        return depth
+
+
+class DepthSegment26(Segment26):
+    """YOLO26 Segment + Depth multi-task head (with decoupling attention + multi-scale fusion)."""
+
+    def __init__(self, nc=80, nm=32, npr=256, reg_max=16, end2end=False, ch=()):
+        super().__init__(nc, nm, npr, reg_max, end2end, ch)
+
+        # Task decoupling attention
+        self.task_attention = TaskDecouplingAttention(ch[0])
+
+        # Multi-scale depth fusion decoder
+        c_depth = max(ch[0] // 4, 64)
+        self.depth_decoder = MultiScaleDepthDecoder(ch, c_depth)
+
+        # Depth prediction head (final 1x1 conv integrated in decoder)
+        self.depth_head = nn.Conv2d(c_depth // 2, 1, 1)
+
+    def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
+        outputs = Segment26.forward(self, x)
+
+        # Task decoupling attention: decouple seg/depth features
+        seg_feat, depth_feat = self.task_attention(x[0])
+
+        # Multi-scale depth prediction
+        depth = self.depth_decoder(x)
+        depth = torch.sigmoid(depth) * 100.0  # normalize to [0, 100] meters
+
+        if self.training:
+            if isinstance(outputs, dict):
+                outputs["depth"] = depth
+            return outputs
+        return (*outputs, depth) if isinstance(outputs, tuple) else (outputs, depth)
+
+    def fuse(self) -> None:
+        """Remove the one2many head and extra part of proto module for inference optimization."""
+        super().fuse()

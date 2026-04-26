@@ -488,11 +488,13 @@ class v8SegmentationLoss(v8DetectionLoss):
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the combined loss for detection and segmentation."""
-        pred_masks, proto = preds["mask_coefficient"].permute(0, 2, 1).contiguous(), preds["proto"]
+        pred_masks = preds["mask_coefficient"].permute(0, 2, 1).contiguous().to(self.device)
+        proto_raw = preds["proto"]
         loss = torch.zeros(5, device=self.device)  # box, seg, cls, dfl, semseg
-        if isinstance(proto, tuple) and len(proto) == 2:
-            proto, pred_semseg = proto
+        if isinstance(proto_raw, tuple) and len(proto_raw) == 2:
+            proto, pred_semseg = proto_raw[0].to(self.device), proto_raw[1].to(self.device)
         else:
+            proto = proto_raw.to(self.device)
             pred_semseg = None
         (fg_mask, target_gt_idx, target_bboxes, _, _), det_loss, _ = self.get_assigned_targets_and_loss(preds, batch)
         # NOTE: re-assign index for consistency for now. Need to be removed in the future.
@@ -1254,3 +1256,166 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion(preds, batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
+
+
+class SILogLoss(nn.Module):
+    """Scale-Invariant Log Depth Loss (MiDaS) - scale-invariant depth loss."""
+
+    def __init__(self, alpha=1.0, beta=1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+
+    def forward(self, pred, target):
+        diff = torch.log(pred + 1e-8) - torch.log(target + 1e-8)
+        n = diff.numel()
+        loss = diff.pow(2).sum() / n - (self.alpha / (n**2)) * diff.sum().pow(2)
+        return self.beta * torch.sqrt(torch.clamp(loss, min=1e-8))
+
+
+class BerHuLoss(nn.Module):
+    """Reverse Huber loss - robust to depth outliers."""
+
+    def __init__(self, threshold=0.2):
+        super().__init__()
+        self.threshold = threshold
+
+    def forward(self, pred, target):
+        diff = torch.abs(pred - target)
+        c = self.threshold * torch.max(diff)
+        mask = diff <= c
+        loss = torch.where(mask, diff, (diff.pow(2) + c.pow(2)) / (2 * c + 1e-8))
+        return loss.mean()
+
+
+class MultiScaleDepthLoss(nn.Module):
+    """Multi-scale depth loss - computes loss at different resolutions."""
+
+    def __init__(self, scales=(1.0, 0.5, 0.25)):
+        super().__init__()
+        self.scales = scales
+        self.silog = SILogLoss()
+        self.berhu = BerHuLoss()
+
+    def forward(self, pred, target):
+        total_loss = 0
+        for scale in self.scales:
+            if scale != 1.0:
+                pred_s = F.interpolate(pred, scale_factor=scale, mode="bilinear", align_corners=False)
+                target_s = F.interpolate(target, scale_factor=scale, mode="bilinear", align_corners=False)
+            else:
+                pred_s, target_s = pred, target
+            total_loss += self.silog(pred_s, target_s) + 0.5 * self.berhu(pred_s, target_s)
+        return total_loss / len(self.scales)
+
+
+class GradNormLoss(nn.Module):
+    """Gradient normalization dynamic weight mechanism."""
+
+    def __init__(self, model, loss_names, initial_weights, alpha=1.5):
+        super().__init__()
+        self.model = model
+        self.loss_names = loss_names
+        self.initial_weights = [w for w in initial_weights]
+        self.alpha = alpha
+        self.weights = nn.Parameter(torch.tensor(initial_weights, dtype=torch.float32))
+        self.loss_history = {name: [] for name in loss_names}
+
+    def update_weights(self, losses):
+        """Update task weights (should be called after backward).
+
+        Args:
+            losses: dict {task_name: loss_value}
+
+        Returns:
+            Weighted total loss
+        """
+        for name in self.loss_names:
+            self.loss_history[name].append(losses[name].item() if hasattr(losses[name], "item") else losses[name])
+
+        total_loss = 0.0
+        for i, name in enumerate(self.loss_names):
+            total_loss = total_loss + self.weights[i] * losses[name]
+
+        return total_loss
+
+    def compute_grad_norm(self):
+        """Compute gradient norms for each task (call after backward)."""
+        grad_norms = []
+        for name in self.loss_names:
+            param = list(self.model.parameters())[0]
+            grad_norm = param.grad.norm().item() if param.grad is not None else 0.0
+            grad_norms.append(grad_norm)
+        return grad_norms
+
+    def step(self, losses):
+        """Execute weight update (call after optimizer.step())."""
+        with torch.no_grad():
+            grad_norms = self.compute_grad_norm()
+            avg_grad = sum(grad_norms) / len(grad_norms) if grad_norms else 1.0
+            for i in range(len(self.weights)):
+                self.weights[i] = self.weights[i] * (grad_norms[i] / (avg_grad + 1e-8)) ** self.alpha
+        return self.weights.detach()
+
+
+class DepthSegmentationLoss(v8SegmentationLoss):
+    """Segmentation + Depth joint loss (with dynamic weights + multi-scale loss)."""
+
+    def __init__(self, model, depth_weight=0.5, use_gradnorm=False, tal_topk=10, tal_topk2=None):
+        super().__init__(model, tal_topk, tal_topk2)
+        self.use_gradnorm = use_gradnorm
+        self.depth_weight = depth_weight
+        self.depth_loss_fn = MultiScaleDepthLoss(scales=(1.0, 0.5))
+        self._loss_names = ["box", "seg", "cls", "dfl", "semseg", "depth"]
+
+        if use_gradnorm:
+            self.gradnorm = GradNormLoss(
+                model,
+                loss_names=["seg", "depth"],
+                initial_weights=[1.0, depth_weight],
+                alpha=1.5,
+            )
+
+    def loss(self, preds, batch):
+        """Compute segmentation + depth joint loss.
+
+        Returns:
+            tuple: (total_loss, loss_items) where loss_items = [box, seg, cls, dfl, semseg, depth]
+        """
+        # Handle end2end nested dict: extract one2many for segmentation loss
+        seg_preds = preds
+        if isinstance(preds, dict) and "one2many" in preds:
+            seg_preds = preds["one2many"]
+
+        seg_loss, loss_items = super().loss(seg_preds, batch)
+        seg_loss_val = seg_loss.sum()
+
+        # Depth loss uses original preds (which has depth key)
+        depth_pred = preds.get("depth") if isinstance(preds, dict) else None
+        if depth_pred is not None:
+            depth_target = batch.get("depth")
+            if depth_target is not None:
+                d_loss = self.depth_loss_fn(depth_pred, depth_target)
+
+                if self.use_gradnorm:
+                    losses = {"seg": seg_loss_val, "depth": d_loss}
+                    total_loss = self.gradnorm.update_weights(losses)
+                else:
+                    # Phase 1: seg head frozen, seg_loss has no grad_fn.
+                    # Only use depth_loss to ensure total_loss has grad_fn.
+                    if seg_loss_val.requires_grad:
+                        total_loss = seg_loss_val + self.depth_weight * d_loss
+                    else:
+                        total_loss = self.depth_weight * d_loss
+
+                depth_loss_item = d_loss.detach()
+                combined_loss_items = torch.cat(
+                    [
+                        loss_items[:4],
+                        loss_items[4:5] if loss_items.numel() >= 5 else torch.zeros(1, device=loss_items.device),
+                        depth_loss_item.unsqueeze(0),
+                    ]
+                )
+                return total_loss, combined_loss_items
+
+        return seg_loss, loss_items

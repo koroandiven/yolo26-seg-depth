@@ -2060,7 +2060,14 @@ class Format:
                 masks, instances, cls = self._format_segments(instances, cls, w, h)
                 masks = torch.from_numpy(masks)
                 cls_tensor = torch.from_numpy(cls.squeeze(1))
-                if self.mask_overlap:
+                # Handle case where all segments were filtered out
+                if len(cls_tensor) == 0:
+                    nl = 0
+                    masks = torch.zeros(
+                        1 if self.mask_overlap else 0, img.shape[0] // self.mask_ratio, img.shape[1] // self.mask_ratio
+                    )
+                    sem_masks = torch.zeros(img.shape[0] // self.mask_ratio, img.shape[1] // self.mask_ratio)
+                elif self.mask_overlap:
                     sem_masks = cls_tensor[masks[0].long() - 1]  # (H, W) from (1, H, W) instance indices
                 else:
                     # Create sem_masks consistent with mask_overlap=True
@@ -2072,7 +2079,7 @@ class Format:
                         weighted_masks[masks == 0] = weights.max() + 1  # handle background
                         smallest_idx = weighted_masks.argmin(dim=0)  # (H, W)
                         sem_masks[overlap] = cls_tensor[smallest_idx[overlap]]
-            else:
+            if nl == 0:
                 masks = torch.zeros(
                     1 if self.mask_overlap else nl, img.shape[0] // self.mask_ratio, img.shape[1] // self.mask_ratio
                 )

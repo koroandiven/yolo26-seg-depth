@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import os
 import torch
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,8 @@ class DepthSegmentDataset(BaseDataset):
             **kwargs: Additional keyword arguments for parent class
         """
         self.use_segments = True
+        self.use_keypoints = False
+        self.use_obb = False
         self.depth_max = depth_max
         self.data = data
         super().__init__(*args, channels=3, **kwargs)
@@ -97,7 +100,7 @@ class DepthSegmentDataset(BaseDataset):
         depth_files = []
         for img_file in img_files:
             img_path = Path(img_file)
-            depth_path = img_path.parent.parent / "depths" / img_path.parent.name / img_path.stem
+            depth_path = img_path.parent.parent.parent / "depths" / img_path.parent.name / img_path.stem
             depth_path = depth_path.with_suffix(".png")
             if depth_path.exists():
                 depth_files.append(str(depth_path))
@@ -151,8 +154,8 @@ class DepthSegmentDataset(BaseDataset):
 
     def load_segment_label(self, img_file: str) -> np.ndarray:
         """Load YOLO format segmentation label."""
-        label_file = Path(img_file).parent.parent / "segments" / Path(img_file).parent.name / Path(img_file).stem
-        label_file = Path(str(label_file).replace("/images/", "/segments/")).with_suffix(".txt")
+        label_file = Path(img_file).parent.parent.parent / "segments" / Path(img_file).parent.name / Path(img_file).stem
+        label_file = label_file.with_suffix(".txt")
         if not label_file.exists():
             return np.zeros((0, 5), dtype=np.float32)
         with open(label_file) as f:
@@ -164,8 +167,8 @@ class DepthSegmentDataset(BaseDataset):
 
     def load_segments(self, img_file: str) -> list:
         """Load segment polygons from YOLO format label file."""
-        label_file = Path(img_file).parent.parent / "segments" / Path(img_file).parent.name / Path(img_file).stem
-        label_file = Path(str(label_file).replace("/images/", "/segments/")).with_suffix(".txt")
+        label_file = Path(img_file).parent.parent.parent / "segments" / Path(img_file).parent.name / Path(img_file).stem
+        label_file = label_file.with_suffix(".txt")
         if not label_file.exists():
             return []
         segments = []
@@ -174,13 +177,11 @@ class DepthSegmentDataset(BaseDataset):
                 parts = line.split()
                 if len(parts) < 6:
                     continue
-                cls = int(parts[0])
                 coords = [float(x) for x in parts[1:]]
                 if len(coords) % 2 != 0:
                     continue
                 segment = np.array(coords, dtype=np.float32).reshape(-1, 2)
-                segment = segment.tolist()
-                segments.append([cls, *segment])
+                segments.append(segment)
         return segments
 
     def get_im_shape(self, img_file: str) -> tuple:
@@ -192,7 +193,10 @@ class DepthSegmentDataset(BaseDataset):
 
     def get_labels(self) -> list[dict]:
         """Return list of label dictionaries for training."""
-        self.label_files = img2label_paths(self.im_files)
+        # Point label files to segments/ directory (polygon labels) instead of labels/ (bbox labels)
+        self.label_files = [
+            x.replace(f"{os.sep}images{os.sep}", f"{os.sep}segments{os.sep}", 1) for x in self.im_files
+        ]
         self.depth_files = self.get_depth_files(self.im_files)
 
         cache_path = Path(self.label_files[0]).parent.with_suffix(".cache")
@@ -211,7 +215,7 @@ class DepthSegmentDataset(BaseDataset):
         labels = cache["labels"]
         if not labels:
             raise RuntimeError(f"No valid labels found in {cache_path}")
-        [cache.pop(k) for k in ("hash", "version", "msgs")]
+        [cache.pop(k, None) for k in ("hash", "version", "msgs")]
         self.im_files = [lb["im_file"] for lb in labels]
         self.depth_files = [lb.get("depth_file", "") for lb in labels]
         return labels
@@ -219,6 +223,8 @@ class DepthSegmentDataset(BaseDataset):
     def build_transforms(self, hyp: dict | None = None) -> Compose:
         """Build and append transforms to the list."""
         if self.augment:
+            # Mosaic augmentation drops the 'depth' key; disable it for depth training
+            hyp.mosaic = 0.0
             transforms = v8_transforms(self, self.imgsz, hyp)
         else:
             transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
@@ -278,35 +284,35 @@ class DepthSegmentDataset(BaseDataset):
 
     def __getitem__(self, index: int) -> dict:
         """Get transformed item from the dataset."""
-        label = self.labels[index].copy()
-        im_file = label["im_file"]
-        depth_file = label.get("depth_file", "")
+        label = self.get_image_and_label(index)
+        depth_file = self.labels[index].get("depth_file", "")
+        h0, w0 = label["ori_shape"]
 
-        im = cv2.imread(im_file)
-        if im is None:
-            raise ValueError(f"Image not found: {im_file}")
-        im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-
-        h0, w0 = im.shape[:2]
-        r = self.imgsz / max(h0, w0)
-        if r != 1:
-            im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
-            if depth_file and Path(depth_file).exists():
-                depth = self.load_depth(depth_file)
-                depth = cv2.resize(depth, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
-            else:
-                depth = np.zeros((self.imgsz, self.imgsz), dtype=np.float32)
+        if depth_file and Path(depth_file).exists():
+            depth = self.load_depth(depth_file)
         else:
-            if depth_file and Path(depth_file).exists():
-                depth = self.load_depth(depth_file)
-            else:
-                depth = np.zeros((h0, w0), dtype=np.float32)
+            depth = np.zeros((h0, w0), dtype=np.float32)
 
+        # Resize depth to match resized image shape from load_image
+        if depth.shape[:2] != label["resized_shape"]:
+            depth = cv2.resize(depth, (label["resized_shape"][1], label["resized_shape"][0]), interpolation=cv2.INTER_LINEAR)
         label["depth"] = depth
-        label = self.update_labels_info(label)
-        label["im_file"] = im_file
 
-        return self.transforms(label)
+        label = self.transforms(label)
+
+        # Ensure depth is numpy array before potential resize
+        if "depth" in label and isinstance(label["depth"], np.ndarray):
+            if label["depth"].shape[:2] != (self.imgsz, self.imgsz):
+                label["depth"] = cv2.resize(
+                    label["depth"], (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR
+                )
+
+        # Remove any None-valued keys to prevent collate_fn issues
+        for k in list(label.keys()):
+            if label[k] is None:
+                del label[k]
+
+        return label
 
     @staticmethod
     def collate_fn(batch: list[dict]) -> dict:
@@ -325,6 +331,8 @@ class DepthSegmentDataset(BaseDataset):
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
             if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+                if any(v is None for v in value):
+                    raise ValueError(f"Key '{k}' contains None values: {value}")
                 value = torch.cat(value, 0)
             new_batch[k] = value
 

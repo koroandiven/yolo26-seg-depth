@@ -224,7 +224,8 @@ class BaseValidator:
             # Loss
             with dt[2]:
                 if self.training:
-                    self.loss += model.loss(batch, preds)[1]
+                    loss_items = model.loss(batch, preds)[1]
+                    self.loss += loss_items.to(self.loss.device)
 
             # Postprocess
             with dt[3]:

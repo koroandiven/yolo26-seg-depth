@@ -1299,6 +1299,9 @@ class MultiScaleDepthLoss(nn.Module):
 
     def forward(self, pred, target):
         total_loss = 0
+        # Ensure target has channel dim for interpolate: (B, H, W) -> (B, 1, H, W)
+        if target.ndim == 3:
+            target = target.unsqueeze(1)
         for scale in self.scales:
             if scale != 1.0:
                 pred_s = F.interpolate(pred, scale_factor=scale, mode="bilinear", align_corners=False)
@@ -1395,6 +1398,7 @@ class DepthSegmentationLoss(v8SegmentationLoss):
         if depth_pred is not None:
             depth_target = batch.get("depth")
             if depth_target is not None:
+                depth_target = depth_target.to(depth_pred.device)
                 d_loss = self.depth_loss_fn(depth_pred, depth_target)
 
                 if self.use_gradnorm:
@@ -1409,13 +1413,25 @@ class DepthSegmentationLoss(v8SegmentationLoss):
                         total_loss = self.depth_weight * d_loss
 
                 depth_loss_item = d_loss.detach()
+                # Ensure all tensors are on the same device before cat
+                device = loss_items.device
+                depth_loss_item = depth_loss_item.to(device)
                 combined_loss_items = torch.cat(
                     [
-                        loss_items[:4],
-                        loss_items[4:5] if loss_items.numel() >= 5 else torch.zeros(1, device=loss_items.device),
+                        loss_items[:4].to(device),
+                        loss_items[4:5].to(device) if loss_items.numel() >= 5 else torch.zeros(1, device=device),
                         depth_loss_item.unsqueeze(0),
                     ]
                 )
                 return total_loss, combined_loss_items
 
-        return seg_loss, loss_items
+        # Always return 6 loss items (append 0 for depth when not available)
+        device = loss_items.device
+        combined_loss_items = torch.cat(
+            [
+                loss_items[:4].to(device),
+                loss_items[4:5].to(device) if loss_items.numel() >= 5 else torch.zeros(1, device=device),
+                torch.zeros(1, device=device),
+            ]
+        )
+        return seg_loss, combined_loss_items

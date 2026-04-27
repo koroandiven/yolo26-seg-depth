@@ -5,9 +5,11 @@ from __future__ import annotations
 from copy import copy
 from pathlib import Path
 
+from ultralytics.data.depth_dataset import DepthSegmentDataset
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import SegmentationModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
+from ultralytics.utils.torch_utils import unwrap_model
 
 
 class SegmentationTrainer(yolo.detect.DetectionTrainer):
@@ -98,10 +100,38 @@ class DepthSegmentTrainer(SegmentationTrainer):
         elif weights:
             model.load(weights)
 
-        from ultralytics.utils.loss import DepthSegmentationLoss
-
-        model.criterion = DepthSegmentationLoss(model, self.depth_weight, self.use_gradnorm)
+        model.depth_weight = self.depth_weight
+        model.use_gradnorm = self.use_gradnorm
         return model
+
+    def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
+        """Build DepthSegmentDataset for multi-task training."""
+        gs = max(int(unwrap_model(self.model).stride.max()), 32)
+        return DepthSegmentDataset(
+            img_path=img_path,
+            imgsz=self.args.imgsz,
+            batch_size=batch,
+            augment=mode == "train",
+            hyp=self.args,
+            rect=self.args.rect or (mode == "val"),
+            cache=self.args.cache or None,
+            single_cls=self.args.single_cls or False,
+            stride=gs,
+            pad=0.0 if mode == "train" else 0.5,
+            prefix=f"{mode}: ",
+            task="segment",
+            data=self.data,
+            fraction=self.args.fraction if mode == "train" else 1.0,
+        )
+
+    def validate(self):
+        """Validate model, ensuring EMA model uses DepthSegmentationLoss."""
+        if self.ema and self.ema.ema:
+            self.ema.ema.depth_weight = self.depth_weight
+            self.ema.ema.use_gradnorm = self.use_gradnorm
+            if getattr(self.ema.ema, "criterion", None) is None:
+                self.ema.ema.criterion = self.ema.ema.init_criterion()
+        return super().validate()
 
     def get_validator(self):
         """Return multi-task validator."""

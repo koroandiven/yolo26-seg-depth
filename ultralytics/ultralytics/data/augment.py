@@ -666,6 +666,8 @@ class Mosaic(BaseMixTransform):
             mosaic_labels.append(labels_patch)
         final_labels = self._cat_labels(mosaic_labels)
         final_labels["img"] = img4
+        if "depth" in labels:
+            final_labels["depth"] = labels["depth"]
         return final_labels
 
     def _mosaic9(self, labels: dict[str, Any]) -> dict[str, Any]:

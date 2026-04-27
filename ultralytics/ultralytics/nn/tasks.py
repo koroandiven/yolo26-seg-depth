@@ -578,6 +578,9 @@ class SegmentationModel(DetectionModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the SegmentationModel."""
+        if getattr(self, "depth_weight", None) is not None:
+            from ultralytics.utils.loss import DepthSegmentationLoss
+            return DepthSegmentationLoss(self, self.depth_weight, getattr(self, "use_gradnorm", False))
         return E2ELoss(self, v8SegmentationLoss) if getattr(self, "end2end", False) else v8SegmentationLoss(self)
 
 

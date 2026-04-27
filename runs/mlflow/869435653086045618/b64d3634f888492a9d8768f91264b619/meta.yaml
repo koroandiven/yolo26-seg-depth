@@ -1,0 +1,15 @@
+artifact_uri: /d01/training_data/yolo-other/yolo26-seg-depth/runs/mlflow/869435653086045618/b64d3634f888492a9d8768f91264b619/artifacts
+end_time: 1777274499428
+entry_point_name: ''
+experiment_id: '869435653086045618'
+lifecycle_stage: active
+run_id: b64d3634f888492a9d8768f91264b619
+run_name: exp113
+run_uuid: b64d3634f888492a9d8768f91264b619
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1777274497955
+status: 3
+tags: []
+user_id: xtladmin

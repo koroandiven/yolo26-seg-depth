@@ -79,53 +79,121 @@ NYU40_CLASS_NAMES = {
 
 # NYU13 name-based mapping (maps name index -> NYU13 class)
 # Build from names field in .mat file
+# IMPORTANT: class 0 is "void" and will be SKIPPED by semantic_to_yolo_labels.
+# Do NOT map any valid object to 0.
 NYU_NAME_TO_13 = {
-    # void (0)
-    "ceiling": 0,
-    "wall": 0,
-    "floor": 0,
     # wall (1)
+    "wall": 1,
+    "ceiling": 1,
+    "pillar": 1,
+    "column": 1,
     # floor (2)
-    # cabinet (3)
+    "floor": 2,
+    "rug": 2,
+    "carpet": 2,
+    "mat": 2,
+    # cabinet (3) - storage furniture
     "cabinet": 3,
     "counter": 3,
     "dresser": 3,
     "refrigerator": 3,
     "fridge": 3,
     "dishwasher": 3,
+    "drawer": 3,
+    "night stand": 3,
+    "nightstand": 3,
+    "bookshelf": 3,
+    "bookcase": 3,
+    "closet": 3,
+    "wardrobe": 3,
+    "cupboard": 3,
+    "shelf": 3,
+    "shelves": 3,
+    "rack": 3,
     # bed (4)
     "bed": 4,
-    "night stand": 4,
-    "nightstand": 4,
-    # chair (5)
+    "crib": 4,
+    "cradle": 4,
+    "bassinet": 4,
+    "mattress": 4,
+    "headboard": 4,
+    "bunk bed": 4,
+    # chair (5) - seating furniture
     "chair": 5,
     "sofa": 5,
     "couch": 5,
+    "stool": 5,
+    "ottoman": 5,
+    "bench": 5,
+    "bean bag": 5,
+    "piano bench": 5,
     # table (6)
     "table": 6,
     "desk": 6,
     "coffee table": 6,
-    # furniture (7) - structural/room elements
+    "countertop": 6,
+    # furniture (7) - structural / room elements
     "door": 7,
     "window": 7,
-    "bookshelf": 7,
-    "bookcase": 7,
-    "picture": 7,
     "blinds": 7,
-    "shelves": 7,
-    "shelf": 7,
     "curtain": 7,
     "shower curtain": 7,
-    "pillow": 7,
     "mirror": 7,
     "bathtub": 7,
     "shower": 7,
     "toilet": 7,
     "sink": 7,
+    "faucet": 7,
     "lamp": 7,
     "light": 7,
+    "fireplace": 7,
+    "stairs": 7,
+    "banister": 7,
+    "railing": 7,
+    "chimney": 7,
     "fire extinguisher": 7,
-    # objects (8) - movable objects (but we use 9 for objects)
+    "picture": 7,
+    "photo": 7,
+    "poster": 7,
+    "whiteboard": 7,
+    "blackboard": 7,
+    "chalkboard": 7,
+    "board": 7,
+    "garage door": 7,
+    "door frame": 7,
+    "door way": 7,
+    "window frame": 7,
+    # objects (8) - movable objects / small items
+    "book": 8,
+    "bottle": 8,
+    "paper": 8,
+    "cup": 8,
+    "glass": 8,
+    "bowl": 8,
+    "plate": 8,
+    "box": 8,
+    "bag": 8,
+    "toy": 8,
+    "computer": 8,
+    "laptop": 8,
+    "keyboard": 8,
+    "mouse": 8,
+    "monitor": 8,
+    "television": 8,
+    "tv": 8,
+    "remote": 8,
+    "phone": 8,
+    "telephone": 8,
+    "clock": 8,
+    "vase": 8,
+    "flower": 8,
+    "plant": 8,
+    "shoe": 8,
+    "clothes": 8,
+    "backpack": 8,
+    "umbrella": 8,
+    "suitcase": 8,
+    "keyboard": 8,
 }
 
 # For direct label values (if labels are already semantic IDs)
@@ -199,13 +267,50 @@ def build_name_to_nyu13_mapping(names_list: list[str]) -> dict[int, int]:
     mapping = {}
     for idx, name in enumerate(names_list):
         name_lower = name.lower()
-        mapped = 9  # default: other/objects
+        mapped = None
 
-        # Check each keyword
+        # Priority 1: exact keyword match
         for keyword, cls_id in NYU_NAME_TO_13.items():
             if keyword in name_lower:
                 mapped = cls_id
                 break
+
+        if mapped is None:
+            # Priority 2: fallback rules for unmapped names
+            if any(k in name_lower for k in
+                    ["wall", "ceiling", "pillar", "column"]):
+                mapped = 1
+            elif any(k in name_lower for k in
+                      ["floor", "rug", "carpet", "mat"]):
+                mapped = 2
+            elif any(k in name_lower for k in
+                      ["cabinet", "counter", "dresser", "drawer",
+                       "refrigerator", "fridge", "shelf", "rack",
+                       "closet", "wardrobe", "cupboard"]):
+                mapped = 3
+            elif any(k in name_lower for k in
+                      ["bed", "crib", "cradle", "bassinet",
+                       "mattress", "headboard", "comforter",
+                       "blanket", "sheet"]):
+                mapped = 4
+            elif any(k in name_lower for k in
+                      ["chair", "sofa", "couch", "stool",
+                       "ottoman", "bench", "seat", "bean bag"]):
+                mapped = 5
+            elif any(k in name_lower for k in
+                      ["table", "desk", "countertop"]):
+                mapped = 6
+            elif any(k in name_lower for k in
+                      ["door", "window", "blind", "curtain",
+                       "mirror", "bathtub", "toilet", "sink",
+                       "shower", "lamp", "light", "fireplace",
+                       "stairs", "banister", "railing", "faucet",
+                       "chimney", "vent", "duct", "heater",
+                       "radiator", "outlet", "switch"]):
+                mapped = 7
+            else:
+                # Default to objects (8) instead of other (9)
+                mapped = 8
 
         mapping[idx] = mapped
 
@@ -223,7 +328,7 @@ def decode_matlab_string(h5_ref):
     if hasattr(h5_ref, "shape"):
         # MATLAB stores strings as uint16 arrays
         try:
-            chars = "".join([chr(c) for c in h5_ref if c > 0])
+            chars = "".join([chr(c) for c in h5_ref.flatten() if c > 0])
             return chars
         except Exception:
             return str(h5_ref)
@@ -606,9 +711,10 @@ def convert_single_sample(
     name_mapping = mat_data.get("name_to_nyu13")
     if name_mapping:
         # Map each pixel's name index to NYU13 class
+        # Note: labels=0 is void/background, labels=N corresponds to name index N-1
         mapped_labels = np.zeros_like(labels)
         for name_idx, nyu13_cls in name_mapping.items():
-            mapped_labels[labels == name_idx] = nyu13_cls
+            mapped_labels[labels == (name_idx + 1)] = nyu13_cls
         labels = mapped_labels
         class_mapping = None  # already mapped
     else:

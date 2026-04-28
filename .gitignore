@@ -3,7 +3,8 @@
 *.pth
 *.onnx
 *.engine
-
+ 
+*.mat
 # Python
 __pycache__/
 *.py[cod]

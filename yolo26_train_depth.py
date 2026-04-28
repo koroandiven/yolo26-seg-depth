@@ -20,7 +20,7 @@ from ultralytics.utils import LOGGER
 
 
 class ProgressiveFreezeCallback:
-    """Progressive training freeze callback - switches freeze strategy at each epoch start."""
+    """Progressive training freeze callback - keep seg head frozen, train depth head + backbone."""
 
     def __init__(
         self, freeze_depth_epochs=50, freeze_seg_epochs=50, use_gradnorm=False
@@ -35,51 +35,41 @@ class ProgressiveFreezeCallback:
         epoch = trainer.epoch
         model = trainer.model
 
-        if not self.initialized or epoch in (
-            self.freeze_depth_epochs,
-            self.freeze_depth_epochs + self.freeze_seg_epochs,
-        ):
+        if not self.initialized or epoch == self.freeze_depth_epochs:
             self._update_freeze(model, epoch)
             self._print_phase(epoch)
             self.initialized = True
 
     def _update_freeze(self, model, epoch):
-        """Update freeze strategy."""
+        """Update freeze strategy: keep seg head frozen, only train depth + backbone."""
         from ultralytics.utils.torch_utils import unwrap_model
 
         model = unwrap_model(model)
 
         if epoch < self.freeze_depth_epochs:
-            # Phase 1: Only train depth head
+            # Phase 1: Only train depth head (backbone frozen)
             for name, param in model.named_parameters():
-                if "depth" not in name:
+                if "depth" in name:
+                    param.requires_grad = True
+                else:
                     param.requires_grad = False
-        elif epoch < self.freeze_depth_epochs + self.freeze_seg_epochs:
-            # Phase 2: Unfreeze segmentation head
+        else:
+            # Phase 2: Train depth head + backbone (seg head always frozen)
             for name, param in model.named_parameters():
-                if "depth" not in name and "seg" not in name and "cv4" not in name:
+                if "seg" in name or "cv3" in name or "cv4" in name or "cv5" in name or "proto" in name:
                     param.requires_grad = False
                 else:
                     param.requires_grad = True
-        else:
-            # Phase 3: Full unfreeze
-            for param in model.parameters():
-                param.requires_grad = True
 
     def _print_phase(self, epoch):
         """Print current training phase."""
         if epoch < self.freeze_depth_epochs:
             phase = 1
-            lr = 1e-3
-        elif epoch < self.freeze_depth_epochs + self.freeze_seg_epochs:
-            phase = 2
-            lr = 5e-4
+            desc = "depth head only (backbone frozen, seg head frozen)"
         else:
-            phase = 3
-            lr = 1e-4
-        LOGGER.info(
-            f"Phase {phase}: lr={lr}, freeze_depth_epochs={self.freeze_depth_epochs}"
-        )
+            phase = 2
+            desc = "depth head + backbone (seg head frozen)"
+        LOGGER.info(f"Phase {phase}: {desc}")
 
 
 def train_progressive():
@@ -92,7 +82,6 @@ def train_progressive():
     parser.add_argument("--depth-weight", type=float, default=0.5)
     parser.add_argument("--use-gradnorm", action="store_true")
     parser.add_argument("--freeze-depth-epochs", type=int, default=50)
-    parser.add_argument("--freeze-seg-epochs", type=int, default=50)
     parser.add_argument("--device", type=str, default="0")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--workers", type=int, default=8)
@@ -104,6 +93,7 @@ def train_progressive():
     )
     parser.add_argument("--project", type=str, default="runs/train_depth")
     parser.add_argument("--name", type=str, default="yolo26-seg-depth-exp")
+    parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint")
     args = parser.parse_args()
 
     # Separate valid YOLO args from custom args
@@ -118,6 +108,7 @@ def train_progressive():
         "workers": args.workers,
         "project": args.project,
         "name": args.name,
+        "resume": args.resume,
     }
 
     trainer = DepthSegmentTrainer(overrides=valid_overrides)
@@ -126,13 +117,11 @@ def train_progressive():
     trainer.depth_weight = args.depth_weight
     trainer.use_gradnorm = args.use_gradnorm
     trainer.freeze_depth_epochs = args.freeze_depth_epochs
-    trainer.freeze_seg_epochs = args.freeze_seg_epochs
     trainer.pretrained_path = args.pretrained  # path to pretrained .pt file
 
-    # Register progressive freeze callback
+    # Register progressive freeze callback (seg head always frozen)
     freeze_callback = ProgressiveFreezeCallback(
         freeze_depth_epochs=args.freeze_depth_epochs,
-        freeze_seg_epochs=args.freeze_seg_epochs,
         use_gradnorm=args.use_gradnorm,
     )
     trainer.add_callback("on_train_epoch_start", freeze_callback.on_train_epoch_start)

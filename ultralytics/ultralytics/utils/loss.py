@@ -1370,6 +1370,7 @@ class DepthSegmentationLoss(v8SegmentationLoss):
         self.depth_weight = depth_weight
         self.depth_loss_fn = MultiScaleDepthLoss(scales=(1.0, 0.5))
         self._loss_names = ["box", "seg", "cls", "dfl", "semseg", "depth"]
+        self.updates = 0  # for resume compatibility with end2end training
 
         if use_gradnorm:
             self.gradnorm = GradNormLoss(
@@ -1378,6 +1379,10 @@ class DepthSegmentationLoss(v8SegmentationLoss):
                 initial_weights=[1.0, depth_weight],
                 alpha=1.5,
             )
+
+    def update(self) -> None:
+        """No-op update for resume compatibility (end2end expects this method)."""
+        self.updates += 1
 
     def loss(self, preds, batch):
         """Compute segmentation + depth joint loss.

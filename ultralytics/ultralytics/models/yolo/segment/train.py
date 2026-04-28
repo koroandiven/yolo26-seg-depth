@@ -83,8 +83,13 @@ class DepthSegmentTrainer(SegmentationTrainer):
         self.depth_weight = getattr(self.args, "depth_weight", 0.5)
 
     def get_model(self, cfg=None, weights=None, verbose=True):
-        """Initialize model and replace with multi-task loss function."""
-        model = SegmentationModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        """Initialize model and replace with multi-task loss function.
+
+        Keep nc from model YAML (80 for COCO) instead of overriding with data YAML.
+        This preserves pretrained segmentation weights while training only depth head.
+        """
+        # Do NOT pass nc=self.data["nc"] to keep COCO 80-class head from pretrained weights
+        model = SegmentationModel(cfg, ch=self.data["channels"], verbose=verbose and RANK == -1)
 
         # Attach hyperparameters (required by v8DetectionLoss)
         model.args = self.args
@@ -103,6 +108,15 @@ class DepthSegmentTrainer(SegmentationTrainer):
         model.depth_weight = self.depth_weight
         model.use_gradnorm = self.use_gradnorm
         return model
+
+    def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
+        """Build optimizer after freezing seg head to prevent it from being updated."""
+        # Freeze seg head permanently (do not train)
+        for n, p in model.named_parameters():
+            if "seg" in n or "cv3" in n or "cv4" in n or "cv5" in n or "proto" in n:
+                p.requires_grad = False
+        LOGGER.info("Frozen seg head (cv3/cv4/cv5/proto) - excluded from optimizer")
+        return super().build_optimizer(model, name, lr, momentum, decay, iterations)
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
         """Build DepthSegmentDataset for multi-task training."""

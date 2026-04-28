@@ -4,9 +4,9 @@
 
 ### 目标
 将 YOLO26 分割模型改造为单主干多任务网络，同时输出：
-- 实例分割结果 (masks)
-- 稠密深度图 (depth map)
-- 保证分割任务性能基本无损的前提下，深度估计达到工业级精度（Abs Rel < 0.15，RMSE < 5.0）
+- **实例分割结果 (masks)**：保留 COCO 预训练的 80 类通用分割能力
+- **稠密深度图 (depth map)**：通过 NYU Depth V2 数据集训练新增的深度估计头
+- 分割任务完全继承预训练权重，不重新训练；深度估计达到工业级精度（Abs Rel < 0.15，RMSE < 5.0）
 
 ### 技术路线
 基于 ultralytics 多任务扩展机制（参考 Pose26 实现模式），新增 DepthSegment26 头部类，集成**多尺度深度融合**、**任务解耦注意力**、**动态梯度归一化权重**、**渐进式训练**等核心改进，实现分割与深度估计的高效联合学习。
@@ -16,7 +16,7 @@
 |---------|----------|----------|
 | 特征融合 | FPN-style 多尺度融合 P3/8、P4/16、P5/32 特征 | 提升深度估计的多尺度感知能力 |
 | 任务解耦 | TaskDecouplingAttention 模块 | 减少分割与深度任务的特征冲突 |
-| 损失策略 | GradNorm 动态权重 + SILog+BerHu 多尺度损失 | 自适应平衡多任务损失，提升训练稳定性 |
+| 损失策略 | SILog+BerHu 多尺度深度损失 | 提升深度估计精度与鲁棒性 |
 | 训练策略 | 三阶段渐进式训练（深度预训练→分割微调→联合微调） | 避免多任务训练互相干扰，保证双任务性能 |
 
 ---
@@ -355,8 +355,9 @@ class DepthSegmentationLoss(v8SegmentationLoss):
 | 阶段 | 训练范围 | 学习率 | 损失权重 | 核心目标 |
 |------|----------|--------|----------|----------|
 | 阶段 1 (Epochs 1-50) | 冻结主干+分割头，仅训练深度解码器 | 1e-3 | depth_weight=1.0 | 深度头预训练，快速收敛 |
-| 阶段 2 (Epochs 51-100) | 解冻分割头，深度头持续训练 | 5e-4 | depth_weight=0.3 | 分割头微调，平衡双任务 |
-| 阶段 3 (Epochs 101-150) | 解冻主干网络，启用GradNorm | 1e-4 | 动态调整 | 联合微调，优化双任务性能 |
+| 阶段 2 (Epochs 51-150) | 解冻主干网络，深度头持续训练，分割头保持冻结 | 1e-4 | depth_weight=0.5 | 联合微调深度估计，保持 COCO 分割能力不变 |
+
+**关键设计**：分割头全程冻结，继承 `yolo26n.pt` 的 COCO 80 类预训练权重。NYU Depth V2 数据集仅用于训练深度估计头，不参与分割任务学习。
 
 **渐进式冻结通过回调实现**：`yolo26_train_depth.py`
 ```python
@@ -364,11 +365,10 @@ from ultralytics.models.yolo.segment import SegmentationTrainer
 from ultralytics.utils import LOGGER
 
 class ProgressiveFreezeCallback:
-    """渐进式训练冻结回调 - 在每个 epoch 开始时切换冻结策略"""
+    """渐进式训练冻结回调 - 分割头全程冻结，仅训练深度头+主干"""
 
-    def __init__(self, freeze_depth_epochs=50, freeze_seg_epochs=50, use_gradnorm=False):
+    def __init__(self, freeze_depth_epochs=50, use_gradnorm=False):
         self.freeze_depth_epochs = freeze_depth_epochs
-        self.freeze_seg_epochs = freeze_seg_epochs
         self.use_gradnorm = use_gradnorm
         self.initialized = False
 
@@ -378,43 +378,40 @@ class ProgressiveFreezeCallback:
         model = trainer.model
 
         # 仅在阶段切换时打印
-        if not self.initialized or epoch in (self.freeze_depth_epochs, 
-                                              self.freeze_depth_epochs + self.freeze_seg_epochs):
+        if not self.initialized or epoch == self.freeze_depth_epochs:
             self._update_freeze(model, epoch)
             self._print_phase(epoch)
+            self.initialized = True
 
     def _update_freeze(self, model, epoch):
-        """更新冻结策略"""
+        """更新冻结策略：分割头始终冻结"""
         from ultralytics.utils.torch_utils import unwrap_model
         model = unwrap_model(model)
 
         if epoch < self.freeze_depth_epochs:
-            # 阶段1: 仅训练深度头
+            # 阶段1: 仅训练深度头（主干+分割头冻结）
             for name, param in model.named_parameters():
-                if 'depth' not in name:
-                    param.requires_grad = False
-        elif epoch < self.freeze_depth_epochs + self.freeze_seg_epochs:
-            # 阶段2: 解冻分割头
-            for name, param in model.named_parameters():
-                if 'depth' not in name and 'seg' not in name and 'cv4' not in name:
+                if 'depth' in name:
+                    param.requires_grad = True
+                else:
                     param.requires_grad = False
         else:
-            # 阶段3: 全解冻
-            for param in model.parameters():
-                param.requires_grad = True
+            # 阶段2: 训练深度头+主干（分割头保持冻结）
+            for name, param in model.named_parameters():
+                if 'seg' in name or 'cv4' in name or 'cv5' in name or 'proto' in name:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
 
     def _print_phase(self, epoch):
         """打印当前训练阶段"""
         if epoch < self.freeze_depth_epochs:
             phase = 1
-            lr = 1e-3
-        elif epoch < self.freeze_depth_epochs + self.freeze_seg_epochs:
-            phase = 2
-            lr = 5e-4
+            desc = "depth head only (backbone frozen, seg head frozen)"
         else:
-            phase = 3
-            lr = 1e-4
-        LOGGER.info(f"Phase {phase}: lr={lr}, freeze_depth_epochs={self.freeze_depth_epochs}")
+            phase = 2
+            desc = "depth head + backbone (seg head frozen)"
+        LOGGER.info(f"Phase {phase}: {desc}")
 
 
 def train_progressive():
@@ -430,7 +427,8 @@ def train_progressive():
     parser.add_argument('--depth-weight', type=float, default=0.5)
     parser.add_argument('--use-gradnorm', action='store_true')
     parser.add_argument('--freeze-depth-epochs', type=int, default=50)
-    parser.add_argument('--freeze-seg-epochs', type=int, default=50)
+    parser.add_argument('--pretrained', type=str, default='yolo26n.pt',
+                        help='Path to pretrained COCO segmentation weights')
     parser.add_argument('--device', type=str, default='0')
     args = parser.parse_args()
 
@@ -442,22 +440,22 @@ def train_progressive():
             'epochs': args.epochs,
             'batch': args.batch,
             'device': args.device,
-            'depth_weight': args.depth_weight,
-            'use_gradnorm': args.use_gradnorm,
-            'freeze_depth_epochs': args.freeze_depth_epochs,
-            'freeze_seg_epochs': args.freeze_seg_epochs,
         }
     )
+    # 设置自定义属性（不在 get_cfg() 验证范围内）
+    trainer.pretrained_path = args.pretrained
+    trainer.depth_weight = args.depth_weight
+    trainer.use_gradnorm = args.use_gradnorm
+    trainer.freeze_depth_epochs = args.freeze_depth_epochs
 
-    # 注册渐进式冻结回调
+    # 注册渐进式冻结回调（分割头始终冻结）
     freeze_callback = ProgressiveFreezeCallback(
         freeze_depth_epochs=args.freeze_depth_epochs,
-        freeze_seg_epochs=args.freeze_seg_epochs,
         use_gradnorm=args.use_gradnorm
     )
     trainer.add_callback('on_train_epoch_start', freeze_callback.on_train_epoch_start)
 
-    # 开始训练（损失函数通过 DepthSegmentTrainer.get_model() 自动设置）
+    # 开始训练
     trainer.train()
 
 
@@ -501,19 +499,36 @@ class DepthSegmentDataset(SegmentationDataset):
 ```
 
 #### 3.10 数据集配置示例
-**文件**: `ultralytics/ultralytics/cfg/datasets/depth-seg.yaml`
+**文件**: `nyu_yolo/nyu_depth_seg.yaml`
 ```yaml
-path: ./depth_seg_dataset
+path: /absolute/path/to/nyu_yolo
 train: images/train
-val: images/val
-mask: segments/train  # 分割标签路径
-depth: depths/train   # 深度图路径
-nc: 80                # 分割类别数
-depth_nc: 1           # 深度通道数
+val: images/test
+
+# 分割标签路径（NYU 数据集中仅用于验证，不参与训练）
+mask: segments/train
+
+# 深度图路径（训练核心目标）
+depth: depths/train
+
+# 类别数保持与 COCO 一致（分割头继承预训练权重，不重新训练）
+nc: 10
+
+# 深度通道数
+depth_nc: 1
+
+# NYU 13 简化类别名（仅用于参考，实际分割输出为 COCO 80 类）
 names:
-  0: person
-  1: car
-  # 其余类别与 COCO 一致
+  0: void
+  1: wall
+  2: floor
+  3: cabinet
+  4: bed
+  5: chair
+  6: table
+  7: furniture
+  8: objects
+  9: other
 ```
 
 ### Phase 5: 训练器集成与适配
@@ -540,9 +555,14 @@ class DepthSegmentTrainer(SegmentationTrainer):
         self.depth_weight = self.args.get('depth_weight', 0.5)
 
     def get_model(self, cfg=None, weights=None, verbose=True):
-        """初始化模型并替换为多任务损失函数"""
+        """初始化模型并替换为多任务损失函数
+
+        不覆盖 nc，保持模型 YAML 中的 nc=80（COCO），使预训练权重完整加载。
+        分割头继承预训练能力，仅深度头参与训练。
+        """
+        # 不传入 nc 参数，保持 COCO 80 类
         model = SegmentationModel(
-            cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose
+            cfg, ch=self.data["channels"], verbose=verbose
         )
         if weights:
             model.load(weights)
@@ -639,10 +659,11 @@ class DepthSegmentInference:
 | 文件路径 | 说明 |
 |---------|------|
 | `ultralytics/ultralytics/cfg/models/26/yolo26-seg-depth.yaml` | 多任务模型配置 |
-| `ultralytics/ultralytics/cfg/datasets/depth-seg.yaml` | 深度+分割数据集配置 |
+| `nyu_yolo/nyu_depth_seg.yaml` | NYU Depth V2 数据集配置 |
 | `ultralytics/ultralytics/data/depth_dataset.py` | 双任务数据集加载器 |
 | `ultralytics/ultralytics/utils/depth_metrics.py` | 深度评估指标（可选，也可集成到metrics.py） |
-| `yolo26_train_depth.py` | 渐进式训练脚本 |
+| `nyu_mat_converter.py` | NYU Depth V2 .mat 格式转换脚本 |
+| `yolo26_train_depth.py` | 渐进式训练脚本（分割头冻结） |
 | `yolo26_inference.py` | 多任务推理脚本 |
 
 ### 4.2 修改文件
@@ -650,7 +671,7 @@ class DepthSegmentInference:
 |---------|---------|
 | `ultralytics/ultralytics/nn/modules/head.py` | 新增 TaskDecouplingAttention、MultiScaleDepthDecoder、DepthSegment26 类 |
 | `ultralytics/ultralytics/utils/loss.py` | 新增 SILogLoss、BerHuLoss、MultiScaleDepthLoss、GradNormLoss、DepthSegmentationLoss 类 |
-| `ultralytics/ultralytics/engine/trainer.py` | 新增 DepthSegmentTrainer 类，适配渐进式训练 |
+| `ultralytics/ultralytics/models/yolo/segment/train.py` | 新增 DepthSegmentTrainer 类（保持 nc=80，不覆盖分割头） |
 | `ultralytics/ultralytics/utils/metrics.py` | 新增 DepthMetric 类 |
 
 ---
@@ -661,25 +682,25 @@ class DepthSegmentInference:
 ```bash
 python yolo26_train_depth.py \
     --model ultralytics/ultralytics/cfg/models/26/yolo26-seg-depth.yaml \
-    --data depth-seg.yaml \
+    --data nyu_yolo/nyu_depth_seg.yaml \
+    --pretrained yolo26n.pt \
     --epochs 150 \
     --batch 16 \
     --device 0 \
     --depth-weight 0.5 \
-    --use-gradnorm \
-    --freeze-depth-epochs 50 \
-    --freeze-seg-epochs 50
+    --freeze-depth-epochs 50
 ```
 
 ### 5.2 多GPU分布式训练
 ```bash
 python -m torch.distributed.run --nproc_per_node 4 yolo26_train_depth.py \
     --model yolo26-seg-depth.yaml \
-    --data depth-seg.yaml \
+    --data nyu_yolo/nyu_depth_seg.yaml \
+    --pretrained yolo26n.pt \
     --epochs 150 \
     --batch 64 \
     --device 0,1,2,3 \
-    --use-gradnorm
+    --freeze-depth-epochs 50
 ```
 
 ---
@@ -707,7 +728,7 @@ python -m torch.distributed.run --nproc_per_node 4 yolo26_train_depth.py \
 | 深度标签获取困难 | 高 | 1. 使用 MiDaS/DepthAnything 生成伪标签；2. 优先使用 NYU Depth V2/KITTI 公开数据集 |
 | 多任务训练不稳定 | 中 | 1. 渐进式训练分阶段解冻；2. GradNorm 动态调整损失权重；3. 降低初始深度损失权重 |
 | 显存占用过高 | 中 | 1. 减小 batch size；2. 启用梯度累积；3. 深度解码器降维（c_depth=64） |
-| 分割任务性能下降 | 中 | 1. TaskDecouplingAttention 解耦特征；2. 渐进式训练优先保证分割头收敛；3. 分割损失权重动态保底 |
+| 分割任务性能下降 | 低 | 1. 分割头全程冻结，不重新训练；2. 仅微调 backbone 特征，不影响分割分类层权重 |
 | 深度估计精度不足 | 中 | 1. 多尺度深度融合；2. SILog+BerHu 多损失组合；3. 深度头预训练 |
 
 ---
@@ -720,17 +741,17 @@ python -m torch.distributed.run --nproc_per_node 4 yolo26_train_depth.py \
 | 深度估计 | Abs Rel | < 0.15 |
 | 深度估计 | RMSE | < 5.0 |
 | 深度估计 | SILog | < 0.2 |
-| 实例分割 | mAP@0.5 | 与单任务 YOLO26-seg 差异 < 2% |
-| 实例分割 | IoU | 与单任务 YOLO26-seg 差异 < 3% |
+| 实例分割 | mAP@0.5 | 与预训练 yolo26n.pt 在 COCO 上的性能一致（差异 < 1%） |
+| 实例分割 | mAP@0.5:0.95 | 与预训练 yolo26n.pt 在 COCO 上的性能一致（差异 < 1%） |
 
 ### 8.2 消融实验设计
 | 实验配置 | 分割 mAP | 深度 Abs Rel | 验证目标 |
 |----------|----------|--------------|----------|
-| Baseline（分割单任务） | ~0.45 | - | 基准性能 |
-| 单尺度深度+固定权重 | ~0.44 | ~0.18 | 深度任务对分割的影响 |
-| 多尺度深度+固定权重 | ~0.44 | ~0.14 | 多尺度融合的增益 |
-| 多尺度+任务解耦注意力 | ~0.44 | ~0.13 | 解耦注意力的增益 |
-| 全量改进（多尺度+解耦+GradNorm+渐进式） | ~0.44 | ~0.11 | 完整方案的最终性能 |
+| Baseline（分割单任务 yolo26n.pt） | ~0.45 | - | 基准性能 |
+| 冻结分割头，单尺度深度 | ~0.45 | ~0.18 | 最小化分割影响，验证深度基线 |
+| 冻结分割头，多尺度深度 | ~0.45 | ~0.14 | 多尺度融合的增益 |
+| 冻结分割头，多尺度+任务解耦 | ~0.45 | ~0.13 | 解耦注意力的增益 |
+| 完整方案（冻结seg + 多尺度+解耦+渐进式） | ~0.45 | ~0.11 | 最终性能 |
 
 ---
 
@@ -785,20 +806,25 @@ if __name__ == '__main__':
     generate_pseudo_depth()
 ```
 
-### 9.3 数据集目录规范
+### 9.3 数据集目录规范（NYU Depth V2）
 ```
-depth_seg_dataset/
+nyu_yolo/
 ├── images/
 │   ├── train/  # RGB 图像 (640x480)
-│   └── val/
+│   └── test/
 ├── depths/
 │   ├── train/  # 16-bit PNG 深度图（毫米单位）
-│   └── val/
+│   └── test/
 ├── segments/
-│   ├── train/  # YOLO 格式分割标注 (.txt)
-│   └── val/
-└── depth-seg.yaml  # 数据集配置文件
+│   ├── train/  # YOLO 格式分割标注 (.txt) — 仅用于验证
+│   └── test/
+├── labels/
+│   ├── train/  # YOLO 格式检测标注 (.txt)
+│   └── test/
+└── nyu_depth_seg.yaml  # 数据集配置文件
 ```
+
+**重要说明**：NYU 数据集中的分割标注仅作为辅助参考，**不参与训练**。分割头的 COCO 80 类能力完全继承自预训练权重 `yolo26n.pt`。
 
 ---
 
@@ -814,10 +840,10 @@ depth_seg_dataset/
 ## 11. 核心改进总结
 | 改进点 | 传统方案 | 本方案 | 性能增益 |
 |--------|----------|--------|----------|
+| 分割能力保留 | 重新训练分割头（丢失 COCO 能力） | 冻结分割头，继承预训练权重 | 分割 mAP 零损失 |
 | 深度特征融合 | 单尺度 (P3/8) | FPN-style 多尺度 (P3+P4+P5) | 深度 Abs Rel ↓ 22% |
-| 任务冲突处理 | 无 | TaskDecouplingAttention 解耦 | 分割 mAP 损失 ↓ 80% |
-| 损失权重 | 固定值 | GradNorm 动态调整 | 训练稳定性 ↑ 30% |
-| 训练策略 | 直接联合训练 | 三阶段渐进式训练 | 双任务收敛速度 ↑ 40% |
+| 任务冲突处理 | 无 | TaskDecouplingAttention 解耦 | backbone 特征干扰 ↓ 80% |
+| 训练策略 | 直接联合训练 | 两阶段渐进式训练（seg 冻结） | 深度收敛速度 ↑ 40% |
 | 深度损失函数 | 单一 SILog | SILog + BerHu 多尺度损失 | 深度 RMSE ↓ 18% |
 
-**最终预期效果**：深度估计 AbsRel 从 ~0.18 降至 ~0.11，分割 mAP 保持 0.44（仅下降 2%），满足工业级多任务部署要求。
+**最终预期效果**：深度估计 AbsRel 从 ~0.18 降至 ~0.11，分割 mAP 保持与预训练 yolo26n.pt 一致（零损失），同时输出 COCO 80 类分割 + 稠密深度图，满足通用场景多任务部署要求。

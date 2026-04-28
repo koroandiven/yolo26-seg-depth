@@ -153,17 +153,35 @@ class DepthSegmentDataset(BaseDataset):
         return x
 
     def load_segment_label(self, img_file: str) -> np.ndarray:
-        """Load YOLO format segmentation label."""
+        """Load YOLO format segmentation label and convert polygons to bboxes."""
         label_file = Path(img_file).parent.parent.parent / "segments" / Path(img_file).parent.name / Path(img_file).stem
         label_file = label_file.with_suffix(".txt")
         if not label_file.exists():
             return np.zeros((0, 5), dtype=np.float32)
         with open(label_file) as f:
-            labels = [x.split() for x in f.read().strip().splitlines() if len(x)]
-        if not labels:
+            lines = [x.split() for x in f.read().strip().splitlines() if len(x)]
+        if not lines:
             return np.zeros((0, 5), dtype=np.float32)
-        labels = np.array(labels, dtype=np.float32)
-        return labels
+
+        bboxes = []
+        for parts in lines:
+            cls_id = float(parts[0])
+            coords = [float(x) for x in parts[1:]]
+            if len(coords) < 6:  # need at least 3 points (6 coords)
+                continue
+            xs = coords[0::2]
+            ys = coords[1::2]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+            cx = (x_min + x_max) / 2
+            cy = (y_min + y_max) / 2
+            w = x_max - x_min
+            h = y_max - y_min
+            bboxes.append([cls_id, cx, cy, w, h])
+
+        if not bboxes:
+            return np.zeros((0, 5), dtype=np.float32)
+        return np.array(bboxes, dtype=np.float32)
 
     def load_segments(self, img_file: str) -> list:
         """Load segment polygons from YOLO format label file."""

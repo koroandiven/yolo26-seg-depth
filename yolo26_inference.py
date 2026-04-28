@@ -11,10 +11,16 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import sys
 import torch
 from pathlib import Path
 from typing import Union, List, Dict, Any, Optional, Tuple, Generator
 from PIL import Image
+
+# Ensure local ultralytics is used instead of site-packages
+local_ultralytics = str(Path(__file__).parent / "ultralytics")
+if local_ultralytics not in sys.path:
+    sys.path.insert(0, local_ultralytics)
 
 from ultralytics import YOLO
 from ultralytics.engine.results import Results

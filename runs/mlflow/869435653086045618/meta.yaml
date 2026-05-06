@@ -1,6 +1,0 @@
-artifact_location: /d01/training_data/yolo-other/yolo26-seg-depth/runs/mlflow/869435653086045618
-creation_time: 1777271689840
-experiment_id: '869435653086045618'
-last_update_time: 1777271689840
-lifecycle_stage: active
-name: runs/train_nyu_depth

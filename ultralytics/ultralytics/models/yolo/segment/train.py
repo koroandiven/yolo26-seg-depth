@@ -7,9 +7,28 @@ from pathlib import Path
 
 from ultralytics.data.depth_dataset import DepthSegmentDataset
 from ultralytics.models import yolo
+from ultralytics.models.yolo.segment.val import SegmentationValidator
 from ultralytics.nn.tasks import SegmentationModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
 from ultralytics.utils.torch_utils import unwrap_model
+
+
+class DepthSegmentValidator(SegmentationValidator):
+    """Validator that keeps enough confusion-matrix rows for COCO-class predictions
+    even when the validation dataset has fewer classes (e.g. NYU depth data)."""
+
+    def init_metrics(self, model: torch.nn.Module) -> None:
+        """Initialize metrics with COCO-scale confusion matrix."""
+        super().init_metrics(model)
+        # The model predicts COCO 80 classes but validation data may have fewer.
+        # Expand confusion matrix to accommodate all COCO predictions.
+        if self.nc < 80:
+            self.nc = 80
+            from ultralytics.utils.metrics import ConfusionMatrix
+
+            self.confusion_matrix = ConfusionMatrix(
+                names={i: str(i) for i in range(self.nc)}, task="detect"
+            )
 
 
 class SegmentationTrainer(yolo.detect.DetectionTrainer):
@@ -81,6 +100,7 @@ class DepthSegmentTrainer(SegmentationTrainer):
         super().__init__(cfg, overrides, _callbacks)
         self.use_gradnorm = getattr(self.args, "use_gradnorm", False)
         self.depth_weight = getattr(self.args, "depth_weight", 0.5)
+        self.freeze_seg = getattr(self.args, "freeze_seg", True)
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         """Initialize model and replace with multi-task loss function.
@@ -107,15 +127,38 @@ class DepthSegmentTrainer(SegmentationTrainer):
 
         model.depth_weight = self.depth_weight
         model.use_gradnorm = self.use_gradnorm
+        model.freeze_seg = self.freeze_seg
+        # Do NOT pre-initialize criterion here - model may still be on CPU.
+        # Lazy initialization in BaseModel.loss() ensures correct device.
         return model
 
+    def set_model_attributes(self):
+        """Preserve COCO model.names (80 classes) instead of overriding with data YAML names.
+
+        The default BaseTrainer behaviour overwrites model.names with self.data["names"],
+        which shrinks the confusion matrix to the validation dataset's class count (e.g.
+        NYU 10 classes) and causes IndexError when COCO-pretrained models predict classes
+        outside that range.
+        """
+        pass
+
     def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
-        """Build optimizer after freezing seg head to prevent it from being updated."""
-        # Freeze seg head permanently (do not train)
-        for n, p in model.named_parameters():
-            if "seg" in n or "cv3" in n or "cv4" in n or "cv5" in n or "proto" in n:
-                p.requires_grad = False
-        LOGGER.info("Frozen seg head (cv3/cv4/cv5/proto) - excluded from optimizer")
+        """Build optimizer after freezing seg head detection params, keep depth components trainable."""
+        import torch.nn as nn
+
+        seg_head = model.model[-1] if hasattr(model, "model") else None
+        if seg_head is not None:
+            # Freeze BN running stats (but keep training mode so forward returns dict with 'depth')
+            for m in seg_head.modules():
+                if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.SyncBatchNorm)):
+                    m.eval()
+            # Only freeze seg detection/segmentation params (NOT depth components)
+            for n, p in seg_head.named_parameters():
+                if "depth" in n or "task_attention" in n:
+                    p.requires_grad = True  # depth components always trainable
+                else:
+                    p.requires_grad = False  # cv2/cv3/cv4/cv5/proto/dfl frozen
+        LOGGER.info("Frozen seg head detection params, depth components trainable")
         return super().build_optimizer(model, name, lr, momentum, decay, iterations)
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
@@ -143,13 +186,16 @@ class DepthSegmentTrainer(SegmentationTrainer):
         if self.ema and self.ema.ema:
             self.ema.ema.depth_weight = self.depth_weight
             self.ema.ema.use_gradnorm = self.use_gradnorm
+            self.ema.ema.freeze_seg = self.freeze_seg
             if getattr(self.ema.ema, "criterion", None) is None:
                 self.ema.ema.criterion = self.ema.ema.init_criterion()
+            elif hasattr(self.ema.ema.criterion, "freeze_seg"):
+                self.ema.ema.criterion.freeze_seg = self.freeze_seg
         return super().validate()
 
     def get_validator(self):
         """Return multi-task validator."""
         self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "sem_loss", "depth_loss"
-        return yolo.segment.SegmentationValidator(
+        return DepthSegmentValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

@@ -27,16 +27,29 @@ from ultralytics.nn.modules.head import DepthSegment26, Segment26
 from ultralytics.utils.torch_utils import select_device
 
 
-def patch_depthsegment26_for_inference():
-    """Patch DepthSegment26.forward to return compatible format for SegmentationPredictor."""
-    _original_forward = DepthSegment26.forward
+def patch_depthsegment26_for_inference(bypass_seg_branch: bool = False):
+    """Patch DepthSegment26.forward to return compatible format for SegmentationPredictor.
+
+    Args:
+        bypass_seg_branch: If True, bypass task_attention.seg_branch and use raw
+            features for segmentation.  Use this for models trained before the
+            seg_branch freeze fix (e.g. exp8/exp10) where seg_branch was optimised
+            for depth and degraded segmentation quality.
+    """
 
     def _patched_forward(self, x):
         """Return standard Segment outputs; store depth in self._last_depth."""
-        outputs = Segment26.forward(self, x)
+        # Segmentation path: optionally bypass seg_branch attention
+        if getattr(self, "_bypass_seg_branch", False):
+            # Use raw x directly (skip task_attention for seg)
+            outputs = Segment26.forward(self, x)
+        else:
+            # Original path via task_attention
+            seg_feat, depth_feat = self.task_attention(x[0])
+            x_seg = [seg_feat, *x[1:]]
+            outputs = Segment26.forward(self, x_seg)
 
-        # Always compute depth (same as original)
-        seg_feat, depth_feat = self.task_attention(x[0])
+        # Depth path always uses task_attention (or raw x if bypass)
         depth = self.depth_decoder(x)
         depth = torch.sigmoid(depth) * 100.0
         self._last_depth = depth
@@ -52,6 +65,7 @@ def patch_depthsegment26_for_inference():
         return outputs
 
     DepthSegment26.forward = _patched_forward
+    DepthSegment26._bypass_seg_branch = bypass_seg_branch
 
 
 def visualize_depth(depth: np.ndarray, orig_shape: tuple) -> np.ndarray:
@@ -72,10 +86,17 @@ def main():
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--device", type=str, default="0")
+    parser.add_argument(
+        "--bypass-seg-branch",
+        action="store_true",
+        help="Bypass task_attention.seg_branch for segmentation inference. "
+             "Use this for models trained before the seg_branch freeze fix "
+             "(e.g. exp8/exp10) where seg_branch degraded segmentation quality.",
+    )
     args = parser.parse_args()
 
     # Patch before loading model
-    patch_depthsegment26_for_inference()
+    patch_depthsegment26_for_inference(bypass_seg_branch=args.bypass_seg_branch)
 
     device = select_device(args.device)
     save_dir = Path(args.save_dir)
@@ -108,16 +129,26 @@ def main():
 
     def _instance_forward(x):
         """Patched forward for this instance only."""
-        outputs = Segment26.forward(head, x)
-        # Compute and store depth, but return standard Segment outputs
-        seg_feat, depth_feat = head.task_attention(x[0])
+        # Segmentation path: optionally bypass seg_branch
+        if getattr(head, "_bypass_seg_branch", False):
+            outputs = Segment26.forward(head, x)
+        else:
+            seg_feat, depth_feat = head.task_attention(x[0])
+            x_seg = [seg_feat, *x[1:]]
+            outputs = Segment26.forward(head, x_seg)
+
+        # Depth path always computes
         depth = head.depth_decoder(x)
         depth = torch.sigmoid(depth) * 100.0
         head._last_depth = depth
         return outputs
 
+    head._bypass_seg_branch = args.bypass_seg_branch
     head.forward = _instance_forward
-    print("Patched instance forward for inference")
+    print(
+        "Patched instance forward for inference "
+        f"(bypass_seg_branch={args.bypass_seg_branch})"
+    )
 
     # Debug: check model forward output format
     print("\n--- Debug: checking model forward output ---")

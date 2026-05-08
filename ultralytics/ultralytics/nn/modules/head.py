@@ -1804,55 +1804,176 @@ class TaskDecouplingAttention(nn.Module):
         return x * seg_att, x * depth_att
 
 
-class MultiScaleDepthDecoder(nn.Module):
-    """Multi-scale depth fusion decoder - FPN-style fusion of P3/P4/P5 features."""
+class MaskGuidedDepthDecoder(nn.Module):
+    """Multi-scale depth decoder with explicit instance mask guidance.
 
-    def __init__(self, ch, c_depth=64):
+    Accepts an optional `mask_guidance` tensor (occupancy + edge) to enforce
+    object-level depth consistency: the network is explicitly told where
+    object boundaries are, preventing depth bleeding across edges.
+    """
+
+    def __init__(self, ch, c_depth=128):
         super().__init__()
         c3, c4, c5 = ch[0], ch[1], ch[2]  # P3/8, P4/16, P5/32
 
+        # Multi-scale depth feature extraction (nearest avoids boundary interpolation artifacts)
         self.depth_p5 = nn.Sequential(
             nn.Conv2d(c5, c_depth, 1),
-            nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
+            nn.Upsample(scale_factor=4, mode="nearest"),
         )
         self.depth_p4 = nn.Sequential(
             nn.Conv2d(c4, c_depth, 1),
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Upsample(scale_factor=2, mode="nearest"),
         )
         self.depth_p3 = nn.Conv2d(c3, c_depth, 1)
 
+        # Mask guidance encoder: 2ch [occupancy, edge] -> c_depth
+        self.mask_encoder = nn.Sequential(
+            Conv(2, c_depth // 2, 3),
+            Conv(c_depth // 2, c_depth, 3),
+        )
+
+        # Spatial attention: learns to blend depth_feat and mask_feat
+        #   near boundary -> keep original depth (preserve discontinuity)
+        #   inside mask   -> trust mask guidance (enforce uniformity)
+        self.spatial_attn = nn.Sequential(
+            Conv(c_depth * 2, c_depth, 3),
+            nn.Conv2d(c_depth, 1, 1),
+            nn.Sigmoid(),
+        )
+
+        # Final fusion: P5 + P4 + P3 + mask_feat
         self.fusion = nn.Sequential(
-            Conv(c_depth * 3, c_depth, k=3),
+            Conv(c_depth * 4, c_depth, k=3),
             Conv(c_depth, c_depth // 2, k=3),
             nn.Conv2d(c_depth // 2, 1, kernel_size=1),
         )
-        self.depth_up = nn.Upsample(scale_factor=8, mode="bilinear", align_corners=False)
+        self.depth_up = nn.Upsample(scale_factor=8, mode="nearest")
 
-    def forward(self, features):
+        # Learnable default mask feature when no guidance is available (better than zeros)
+        self.default_mask_feat = nn.Parameter(torch.zeros(1, c_depth, 1, 1))
+
+    def forward(self, features, mask_guidance=None):
         p3, p4, p5 = features[0], features[1], features[2]
 
         d_p5 = self.depth_p5(p5)
         d_p4 = self.depth_p4(p4)
         d_p3 = self.depth_p3(p3)
 
-        fused = torch.cat([d_p5, d_p4, d_p3], dim=1)
+        if mask_guidance is not None:
+            # Resize mask to P3 resolution
+            if mask_guidance.shape[-2:] != d_p3.shape[-2:]:
+                mask_guidance = F.interpolate(
+                    mask_guidance, size=d_p3.shape[-2:], mode="nearest"
+                )
+
+            # Encode mask guidance
+            mask_feat = self.mask_encoder(mask_guidance)
+
+            # Soft fusion via spatial attention
+            attn = self.spatial_attn(torch.cat([d_p3, mask_feat], dim=1))
+            # attn ~ 1 near boundary (keep original depth), ~ 0 inside mask (use guidance)
+            d_p3 = d_p3 * attn + mask_feat * (1.0 - attn)
+        else:
+            # Use learnable default mask feature (trained to handle no-guidance inference)
+            mask_feat = self.default_mask_feat.expand_as(d_p3)
+
+        # Concatenate all features
+        fused = torch.cat([d_p5, d_p4, d_p3, mask_feat], dim=1)
         depth = self.fusion(fused)
         depth = self.depth_up(depth)
         return depth
 
 
 class DepthSegment26(Segment26):
-    """YOLO26 Segment + Depth multi-task head (with decoupling attention + multi-scale fusion)."""
+    """YOLO26 Segment + Depth multi-task head (with decoupling attention + mask-guided depth)."""
 
-    def __init__(self, nc=80, nm=32, npr=256, reg_max=16, end2end=False, ch=()):
+    def __init__(self, nc=80, nm=32, npr=256, reg_max=16, end2end=False, ch=(), depth_scale=100.0):
         super().__init__(nc, nm, npr, reg_max, end2end, ch)
+
+        self.depth_scale = depth_scale
 
         # Task decoupling attention
         self.task_attention = TaskDecouplingAttention(ch[0])
 
-        # Multi-scale depth fusion decoder (increased capacity for better depth estimation)
+        # Mask-guided depth decoder
         c_depth = max(ch[0] // 2, 128)
-        self.depth_decoder = MultiScaleDepthDecoder(ch, c_depth)
+        self.mask_guided_depth_decoder = MaskGuidedDepthDecoder(ch, c_depth)
+
+        # Batch cache for training mask guidance (set by BaseModel.loss)
+        self._cached_batch = None
+
+    def _generate_mask_guidance(self, masks, batch_idx, target_shape):
+        """Generate [B, 2, H, W] mask guidance from instance masks.
+
+        Supports two input formats:
+          - [B, H, W] instance index map (overlap_mask format, one per image)
+          - [N_instances, H, W] binary masks + batch_idx mapping
+
+        Channel 0: occupancy map (union of all instances)
+        Channel 1: edge map (Sobel on occupancy)
+        """
+        B, _, H, W = target_shape
+        device = masks.device
+
+        # Resize masks to target resolution
+        if masks.shape[-2:] != (H, W):
+            masks = F.interpolate(
+                masks.unsqueeze(1).float(), size=(H, W), mode="nearest"
+            ).squeeze(1)
+
+        occupancy = torch.zeros(B, 1, H, W, device=device)
+        edge = torch.zeros(B, 1, H, W, device=device)
+
+        sobel_x = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+            device=device, dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+            device=device, dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        if masks.ndim == 3 and masks.shape[0] == B:
+            # [B, H, W] instance index map (overlap format)
+            for b in range(B):
+                occ_b = (masks[b] > 0).float()  # [H, W]
+                occupancy[b, 0] = occ_b
+
+                occ_exp = occ_b.unsqueeze(0).unsqueeze(0)
+                ex = F.conv2d(occ_exp, sobel_x, padding=1).abs()
+                ey = F.conv2d(occ_exp, sobel_y, padding=1).abs()
+                edge_map = (ex + ey).squeeze()
+                # Suppress Sobel padding artifacts at image boundaries
+                edge_map[0, :] = 0
+                edge_map[-1, :] = 0
+                edge_map[:, 0] = 0
+                edge_map[:, -1] = 0
+                edge[b, 0] = edge_map
+
+        elif masks.ndim == 3 and batch_idx is not None:
+            # [N_instances, H, W] binary instance mask format
+            bidx = batch_idx.view(-1)
+            for b in range(B):
+                inst_b = masks[bidx == b]  # [N_i, H, W]
+                if inst_b.numel() == 0:
+                    continue
+
+                occ_b = inst_b.any(dim=0).float()
+                occupancy[b, 0] = occ_b
+
+                occ_exp = occ_b.unsqueeze(0).unsqueeze(0)
+                ex = F.conv2d(occ_exp, sobel_x, padding=1).abs()
+                ey = F.conv2d(occ_exp, sobel_y, padding=1).abs()
+                edge_map = (ex + ey).squeeze()
+                # Suppress Sobel padding artifacts at image boundaries
+                edge_map[0, :] = 0
+                edge_map[-1, :] = 0
+                edge_map[:, 0] = 0
+                edge_map[:, -1] = 0
+                edge[b, 0] = edge_map
+
+        return torch.cat([occupancy, edge], dim=1)
 
     def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
         # Task decoupling attention: decouple seg/depth features on P3
@@ -1865,15 +1986,30 @@ class DepthSegment26(Segment26):
         # Segmentation forward uses decoupled seg features
         outputs = Segment26.forward(self, x_seg)
 
-        # Multi-scale depth prediction uses decoupled depth features
-        depth = self.depth_decoder(x_depth)
-        depth = torch.sigmoid(depth) * 100.0  # normalize to [0, 100] meters
+        # Generate mask guidance for depth decoder
+        mask_guidance = None
+        if self.training and self._cached_batch is not None:
+            masks = self._cached_batch.get("masks")
+            batch_idx = self._cached_batch.get("batch_idx")
+            if masks is not None and batch_idx is not None:
+                mask_guidance = self._generate_mask_guidance(
+                    masks, batch_idx, x[0].shape
+                )
+            self._cached_batch = None  # consume
+
+        # Mask-guided depth prediction
+        depth = self.mask_guided_depth_decoder(x_depth, mask_guidance)
+        depth = torch.sigmoid(depth) * self.depth_scale  # normalize to [0, depth_scale] meters
 
         if self.training:
             if isinstance(outputs, dict):
                 outputs["depth"] = depth
             return outputs
-        return (*outputs, depth) if isinstance(outputs, tuple) else (outputs, depth)
+
+        # Eval mode: store depth for external retrieval, return standard format
+        # (SegmentationPredictor expects exact Segment26 output format)
+        self._last_depth = depth
+        return outputs
 
     def fuse(self) -> None:
         """Remove the one2many head and extra part of proto module for inference optimization."""

@@ -334,7 +334,12 @@ class BaseModel(torch.nn.Module):
             self.criterion = self.init_criterion()
 
         if preds is None:
+            # Cache batch for mask-guided depth head (consumed in forward)
+            if hasattr(self.model[-1], "_cached_batch"):
+                self.model[-1]._cached_batch = batch
             preds = self.forward(batch["img"])
+            if hasattr(self.model[-1], "_cached_batch"):
+                self.model[-1]._cached_batch = None
         return self.criterion(preds, batch)
 
     def init_criterion(self):
@@ -1708,6 +1713,8 @@ def parse_model(d, ch, verbose=True):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26 or m is DepthSegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
+            if m is DepthSegment26:
+                args.append(d.get("depth_scale", 100.0))
             if m in {
                 Detect,
                 YOLOEDetect,

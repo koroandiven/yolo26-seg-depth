@@ -1316,6 +1316,10 @@ class MaskEdgeDepthLoss(nn.Module):
         # Masks may be uint8; work in float32 for all intermediate computations
         mask_dtype = torch.float32
 
+        # Ensure masks match target resolution
+        if masks.shape[-2:] != (H, W):
+            masks = F.interpolate(masks.unsqueeze(1).float(), size=(H, W), mode="nearest").squeeze(1)
+
         if masks.ndim == 3 and masks.shape[0] == B:
             # [B, H, W] instance index map (overlap format)
             # Any non-zero pixel is occupied
@@ -1403,16 +1407,132 @@ class MaskEdgeDepthLoss(nn.Module):
         return self.smooth_weight * smooth_loss + self.edge_weight * edge_align_loss
 
 
+class MaskConsistencyDepthLoss(nn.Module):
+    """Instance mask-guided depth consistency loss.
+
+    Penalizes large depth variance within each instance mask, encouraging
+    the model to predict uniform depth for the same object.  This directly
+    addresses the "depth bleeding at object edges" problem by telling the
+    network: "pixels inside the same mask should have similar depth".
+
+    Args:
+        weight (float): Overall loss weight.
+        var_weight (float): Weight for variance penalty (in-mask depth uniformity).
+        smooth_weight (float): Weight for in-mask gradient penalty (smoothness).
+        min_pixels (int): Ignore masks with fewer pixels than this threshold.
+    """
+
+    def __init__(self, weight=0.15, var_weight=1.0, smooth_weight=0.5, min_pixels=20):
+        super().__init__()
+        self.weight = weight
+        self.var_weight = var_weight
+        self.smooth_weight = smooth_weight
+        self.min_pixels = min_pixels
+
+    def forward(self, pred_depth, masks, batch_idx):
+        """
+        Args:
+            pred_depth: [B, 1, H, W] predicted depth map.
+            masks: [N_instances, H_mask, W_mask] binary instance masks.
+            batch_idx: [N_instances] int tensor, image index per instance.
+
+        Returns:
+            Scalar loss tensor.
+        """
+        if masks is None or masks.numel() == 0 or batch_idx is None:
+            return torch.tensor(0.0, device=pred_depth.device, dtype=pred_depth.dtype)
+
+        B, _, H, W = pred_depth.shape
+        device = pred_depth.device
+        dtype = pred_depth.dtype
+
+        # Resize masks to depth resolution if needed
+        if masks.shape[-2:] != (H, W):
+            masks = F.interpolate(
+                masks.unsqueeze(1).float(), size=(H, W), mode="nearest"
+            ).squeeze(1)
+
+        # Sobel kernels for in-mask smoothness (float32 to match conv2d requirements)
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            device=device, dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            device=device, dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+
+        total_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        valid_masks = 0
+
+        for b in range(B):
+            pred_b = pred_depth[b, 0]  # [H, W]
+
+            if masks.ndim == 3 and masks.shape[0] == B:
+                # [B, H, W] instance index map format
+                inst_ids = masks[b].unique()
+                inst_ids = inst_ids[inst_ids > 0]  # ignore background (0)
+                for inst_id in inst_ids:
+                    m_bin = masks[b] == inst_id
+                    n_pix = m_bin.sum().item()
+                    if n_pix < self.min_pixels:
+                        continue
+
+                    vals = pred_b[m_bin]
+                    mean_d = vals.mean()
+                    var = ((vals - mean_d) ** 2).mean()
+
+                    m_f = m_bin.float().unsqueeze(0).unsqueeze(0)
+                    pred_exp = pred_b.unsqueeze(0).unsqueeze(0)
+                    gx = F.conv2d(pred_exp.float(), sobel_x, padding=1).abs()
+                    gy = F.conv2d(pred_exp.float(), sobel_y, padding=1).abs()
+                    g_in = ((gx + gy) * m_f).sum() / (n_pix + 1e-8)
+
+                    total_loss += self.var_weight * var + self.smooth_weight * g_in
+                    valid_masks += 1
+
+            elif masks.ndim == 3 and batch_idx is not None:
+                # [N_instances, H, W] binary mask format
+                inst_mask = masks[batch_idx.view(-1) == b]
+                if inst_mask.numel() == 0:
+                    continue
+
+                for m in inst_mask:
+                    m_bin = m > 0.5
+                    n_pix = m_bin.sum().item()
+                    if n_pix < self.min_pixels:
+                        continue
+
+                    vals = pred_b[m_bin]
+                    mean_d = vals.mean()
+                    var = ((vals - mean_d) ** 2).mean()
+
+                    m_f = m_bin.float().unsqueeze(0).unsqueeze(0)
+                    pred_exp = pred_b.unsqueeze(0).unsqueeze(0)
+                    gx = F.conv2d(pred_exp.float(), sobel_x, padding=1).abs()
+                    gy = F.conv2d(pred_exp.float(), sobel_y, padding=1).abs()
+                    g_in = ((gx + gy) * m_f).sum() / (n_pix + 1e-8)
+
+                    total_loss += self.var_weight * var + self.smooth_weight * g_in
+                    valid_masks += 1
+
+        if valid_masks == 0:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        return self.weight * (total_loss / valid_masks)
+
+
 class MultiScaleDepthLoss(nn.Module):
     """Multi-scale depth loss - computes loss at different resolutions."""
 
-    def __init__(self, scales=(1.0, 0.5, 0.25), edge_weight=0.2):
+    def __init__(self, scales=(1.0, 0.5, 0.25), edge_weight=0.2, consistency_weight=0.15):
         super().__init__()
         self.scales = scales
         self.silog = SILogLoss()
         self.berhu = BerHuLoss()
         self.edge_loss_fn = MaskEdgeDepthLoss(edge_weight=edge_weight, smooth_weight=0.1)
+        self.consistency_fn = MaskConsistencyDepthLoss(weight=consistency_weight)
         self.edge_weight = edge_weight
+        self.consistency_weight = consistency_weight
 
     def forward(self, pred, target, masks=None, batch_idx=None):
         total_loss = 0
@@ -1431,6 +1551,10 @@ class MultiScaleDepthLoss(nn.Module):
         # Mask edge-aware loss (only at full resolution)
         if masks is not None and batch_idx is not None and self.edge_weight > 0:
             total_loss += self.edge_loss_fn(pred, masks, batch_idx)
+
+        # Instance mask consistency loss (encourage uniform depth inside each object)
+        if masks is not None and batch_idx is not None and self.consistency_weight > 0:
+            total_loss += self.consistency_fn(pred, masks, batch_idx)
 
         return total_loss
 

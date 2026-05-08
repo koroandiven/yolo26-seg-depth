@@ -1,8 +1,8 @@
 # Models (too large)
 # *.pt
 # *.pth
-# *.onnx
-# *.engine
+*.onnx
+*.engine
  
 *.mat
 # Python

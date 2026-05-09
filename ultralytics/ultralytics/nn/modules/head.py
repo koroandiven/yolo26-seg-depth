@@ -16,7 +16,7 @@ from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
-from .conv import Conv, DWConv
+from .conv import Conv, DWConv, autopad
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
@@ -1804,54 +1804,124 @@ class TaskDecouplingAttention(nn.Module):
         return x * seg_att, x * depth_att
 
 
-class MaskGuidedDepthDecoder(nn.Module):
-    """Multi-scale depth decoder with explicit instance mask guidance.
+class DepthConv(nn.Module):
+    """Depth-estimation convolution: Conv2d + SiLU without BatchNorm.
 
-    Accepts an optional `mask_guidance` tensor (occupancy + edge) to enforce
-    object-level depth consistency: the network is explicitly told where
-    object boundaries are, preventing depth bleeding across edges.
+    BatchNorm can memorize spatial bias from training data (e.g. top-left
+    always being farther in NYU). Removing BN prevents the decoder from
+    encoding position-dependent statistics.
+    """
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1):
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=True)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.act(self.conv(x))
+
+
+class SpatialBiasCorrection(nn.Module):
+    """Learnable spatial bias correction for depth output.
+
+    Trains a low-resolution bias map (H/8 x W/8) that is upsampled and
+    subtracted from the final depth prediction. During training it is
+    regularized toward zero so the model does not rely on it; any residual
+    non-zero value represents a dataset-level spatial bias that can be
+    automatically removed at inference.
+    """
+
+    def __init__(self, size=80):
+        super().__init__()
+        # Low-resolution bias map (learnable)
+        self.bias_map = nn.Parameter(torch.zeros(1, 1, size, size))
+        self.size = size
+
+    def forward(self, depth):
+        """Args:
+            depth: [B, 1, H, W] raw depth prediction (before sigmoid/scale)
+        Returns:
+            [B, 1, H, W] bias-corrected depth
+        """
+        _, _, h, w = depth.shape
+        if h != self.size or w != self.size:
+            bias = F.interpolate(self.bias_map, size=(h, w), mode="bilinear", align_corners=False)
+        else:
+            bias = self.bias_map
+        return depth - bias
+
+
+class DepthResidualBlock(nn.Module):
+    """Residual block for depth feature refinement (no BatchNorm)."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = DepthConv(channels, channels, k=3)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=True)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.act(x + self.conv2(self.conv1(x)))
+
+
+class MaskGuidedDepthDecoder(nn.Module):
+    """Multi-scale depth decoder with expanded capacity and weak mask guidance.
+
+    Mask guidance is used ONLY for edge hints (where object boundaries are),
+    not for enforcing uniform depth inside objects. This prevents the model
+    from "cheating" by outputting a constant depth per mask region.
     """
 
     def __init__(self, ch, c_depth=128):
         super().__init__()
         c3, c4, c5 = ch[0], ch[1], ch[2]  # P3/8, P4/16, P5/32
 
-        # Multi-scale depth feature extraction (nearest avoids boundary interpolation artifacts)
+        # Multi-scale depth feature extraction
         self.depth_p5 = nn.Sequential(
             nn.Conv2d(c5, c_depth, 1),
-            nn.Upsample(scale_factor=4, mode="nearest"),
+            nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
         )
         self.depth_p4 = nn.Sequential(
             nn.Conv2d(c4, c_depth, 1),
-            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
         )
         self.depth_p3 = nn.Conv2d(c3, c_depth, 1)
 
         # Mask guidance encoder: 2ch [occupancy, edge] -> c_depth
+        # Only edge channel is used for depth discontinuity hints
         self.mask_encoder = nn.Sequential(
-            Conv(2, c_depth // 2, 3),
-            Conv(c_depth // 2, c_depth, 3),
+            DepthConv(2, c_depth // 4, 3),
+            DepthConv(c_depth // 4, c_depth // 2, 3),
         )
 
-        # Spatial attention: learns to blend depth_feat and mask_feat
-        #   near boundary -> keep original depth (preserve discontinuity)
-        #   inside mask   -> trust mask guidance (enforce uniformity)
-        self.spatial_attn = nn.Sequential(
-            Conv(c_depth * 2, c_depth, 3),
-            nn.Conv2d(c_depth, 1, 1),
-            nn.Sigmoid(),
+        # Fusion: P5 + P4 + P3 + weak mask_feat
+        self.fusion_in = DepthConv(c_depth * 3 + c_depth // 2, c_depth, k=3)
+
+        # Deep refinement with residual blocks (expanded capacity)
+        self.refine_blocks = nn.Sequential(
+            DepthResidualBlock(c_depth),
+            DepthResidualBlock(c_depth),
+            DepthResidualBlock(c_depth),
+            DepthResidualBlock(c_depth),
         )
 
-        # Final fusion: P5 + P4 + P3 + mask_feat
-        self.fusion = nn.Sequential(
-            Conv(c_depth * 4, c_depth, k=3),
-            Conv(c_depth, c_depth // 2, k=3),
-            nn.Conv2d(c_depth // 2, 1, kernel_size=1),
+        self.fusion_out = nn.Sequential(
+            DepthConv(c_depth, c_depth // 2, k=3),
+            DepthConv(c_depth // 2, c_depth // 4, k=3),
         )
-        self.depth_up = nn.Upsample(scale_factor=8, mode="nearest")
+        self.depth_head = nn.Conv2d(c_depth // 4, 1, kernel_size=1, bias=True)
+        self.depth_up = nn.Upsample(scale_factor=8, mode="bilinear", align_corners=False)
+        # Post-upsample refinement
+        self.depth_refine = nn.Sequential(
+            DepthConv(1, 16, k=3),
+            nn.Conv2d(16, 1, kernel_size=1, bias=True),
+        )
 
-        # Learnable default mask feature when no guidance is available (better than zeros)
-        self.default_mask_feat = nn.Parameter(torch.zeros(1, c_depth, 1, 1))
+        # Learnable spatial bias correction (regularized toward zero)
+        self.bias_correction = SpatialBiasCorrection(size=80)
+
+        # Learnable default mask feature when no guidance is available
+        self.default_mask_feat = nn.Parameter(torch.zeros(1, c_depth // 2, 1, 1))
 
     def forward(self, features, mask_guidance=None):
         p3, p4, p5 = features[0], features[1], features[2]
@@ -1866,22 +1936,30 @@ class MaskGuidedDepthDecoder(nn.Module):
                 mask_guidance = F.interpolate(
                     mask_guidance, size=d_p3.shape[-2:], mode="nearest"
                 )
-
-            # Encode mask guidance
             mask_feat = self.mask_encoder(mask_guidance)
-
-            # Soft fusion via spatial attention
-            attn = self.spatial_attn(torch.cat([d_p3, mask_feat], dim=1))
-            # attn ~ 1 near boundary (keep original depth), ~ 0 inside mask (use guidance)
-            d_p3 = d_p3 * attn + mask_feat * (1.0 - attn)
+            # Apply a small weight to mask_feat so the model cannot
+            # "cheat" by relying too heavily on mask guidance.
+            mask_feat = mask_feat * 0.3
         else:
-            # Use learnable default mask feature (trained to handle no-guidance inference)
-            mask_feat = self.default_mask_feat.expand_as(d_p3)
+            # Use learnable default mask feature
+            mask_feat = self.default_mask_feat.expand(
+                d_p3.size(0), -1, d_p3.size(2), d_p3.size(3)
+            )
 
-        # Concatenate all features
+        # Concatenate all features (P3/P4/P5 + weak mask)
         fused = torch.cat([d_p5, d_p4, d_p3, mask_feat], dim=1)
-        depth = self.fusion(fused)
+        depth_feat = self.fusion_in(fused)
+        depth_feat = self.refine_blocks(depth_feat)
+        depth_feat = self.fusion_out(depth_feat)
+        depth = self.depth_head(depth_feat)
         depth = self.depth_up(depth)
+        depth = self.depth_refine(depth)
+        # Apply learnable spatial bias correction (removes dataset-level
+        # positional bias such as "top-left always deeper" or "left half
+        # always farther" that the model may have memorised)
+        bias_corr = getattr(self, "bias_correction", None)
+        if bias_corr is not None:
+            depth = bias_corr(depth)
         return depth
 
 
@@ -1893,8 +1971,12 @@ class DepthSegment26(Segment26):
 
         self.depth_scale = depth_scale
 
-        # Task decoupling attention
+        # Task decoupling attention for P3 (main depth feature)
         self.task_attention = TaskDecouplingAttention(ch[0])
+
+        # Light task decoupling for P4/P5 to reduce segmentation bias in depth path
+        self.task_attention_p4 = TaskDecouplingAttention(ch[1]) if len(ch) > 1 else None
+        self.task_attention_p5 = TaskDecouplingAttention(ch[2]) if len(ch) > 2 else None
 
         # Mask-guided depth decoder
         c_depth = max(ch[0] // 2, 128)
@@ -1976,12 +2058,18 @@ class DepthSegment26(Segment26):
         return torch.cat([occupancy, edge], dim=1)
 
     def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
-        # Task decoupling attention: decouple seg/depth features on P3
-        seg_feat, depth_feat = self.task_attention(x[0])
+        # Task decoupling attention: decouple seg/depth features on all scales
+        seg_feat_p3, depth_feat_p3 = self.task_attention(x[0])
+        seg_feat_p4, depth_feat_p4 = (
+            self.task_attention_p4(x[1]) if self.task_attention_p4 is not None else (x[1], x[1])
+        )
+        seg_feat_p5, depth_feat_p5 = (
+            self.task_attention_p5(x[2]) if self.task_attention_p5 is not None else (x[2], x[2])
+        )
 
         # Build task-specific feature pyramids
-        x_seg = [seg_feat, *x[1:]]
-        x_depth = [depth_feat, *x[1:]]
+        x_seg = [seg_feat_p3, seg_feat_p4, seg_feat_p5]
+        x_depth = [depth_feat_p3, depth_feat_p4, depth_feat_p5]
 
         # Segmentation forward uses decoupled seg features
         outputs = Segment26.forward(self, x_seg)
@@ -1992,12 +2080,18 @@ class DepthSegment26(Segment26):
             masks = self._cached_batch.get("masks")
             batch_idx = self._cached_batch.get("batch_idx")
             if masks is not None and batch_idx is not None:
-                mask_guidance = self._generate_mask_guidance(
-                    masks, batch_idx, x[0].shape
-                )
+                # Drop mask guidance 30% of the time during training so that
+                # default_mask_feat gets trained and the decoder learns to
+                # estimate depth from image content, not just mask shapes.
+                if torch.rand(1, device=masks.device).item() > 0.30:
+                    mask_guidance = self._generate_mask_guidance(
+                        masks, batch_idx, x[0].shape
+                    )
             self._cached_batch = None  # consume
 
-        # Mask-guided depth prediction
+        # Mask-guided depth prediction (eval mode: no mask guidance by default)
+        if not self.training:
+            mask_guidance = None
         depth = self.mask_guided_depth_decoder(x_depth, mask_guidance)
         depth = torch.sigmoid(depth) * self.depth_scale  # normalize to [0, depth_scale] meters
 

@@ -3,7 +3,8 @@
 # *.pth
 *.onnx
 *.engine
- 
+*.mp4
+
 *.mat
 # Python
 __pycache__/

@@ -1266,9 +1266,13 @@ class SILogLoss(nn.Module):
         self.alpha = alpha
         self.beta = beta
 
-    def forward(self, pred, target):
+    def forward(self, pred, target, valid_mask=None):
         diff = torch.log(pred + 1e-8) - torch.log(target + 1e-8)
+        if valid_mask is not None:
+            diff = diff[valid_mask]
         n = diff.numel()
+        if n == 0:
+            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         loss = diff.pow(2).sum() / n - (self.alpha / (n**2)) * diff.sum().pow(2)
         return self.beta * torch.sqrt(torch.clamp(loss, min=1e-8))
 
@@ -1280,8 +1284,12 @@ class BerHuLoss(nn.Module):
         super().__init__()
         self.threshold = threshold
 
-    def forward(self, pred, target):
+    def forward(self, pred, target, valid_mask=None):
         diff = torch.abs(pred - target)
+        if valid_mask is not None:
+            diff = diff[valid_mask]
+        if diff.numel() == 0:
+            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         c = self.threshold * torch.max(diff)
         mask = diff <= c
         loss = torch.where(mask, diff, (diff.pow(2) + c.pow(2)) / (2 * c + 1e-8))
@@ -1521,32 +1529,84 @@ class MaskConsistencyDepthLoss(nn.Module):
         return self.weight * (total_loss / valid_masks)
 
 
+class EdgeAwareSmoothnessLoss(nn.Module):
+    """Edge-aware smoothness loss: penalizes overly-smooth depth predictions.
+
+    Uses image gradients to weight the penalty: texture-rich regions can have
+    larger depth gradients, while smooth regions should have smooth depths.
+    This prevents the model from outputting a constant depth map.
+    """
+
+    def __init__(self, weight=0.1):
+        super().__init__()
+        self.weight = weight
+
+    def forward(self, pred, img=None):
+        """Args:
+            pred: [B, 1, H, W] depth prediction
+            img: [B, 3, H, W] RGB image (optional, for edge-aware weighting)
+        """
+        b, _, h, w = pred.shape
+
+        # Compute depth gradients
+        d_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+        d_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+
+        if img is not None and img.shape[-2:] == (h, w):
+            # Compute image luminance and its gradients
+            lum = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
+            i_dx = torch.abs(lum[:, :, :, 1:] - lum[:, :, :, :-1])
+            i_dy = torch.abs(lum[:, :, 1:, :] - lum[:, :, :-1, :])
+            # Weight: allow large depth gradients where image has strong edges
+            w_dx = torch.exp(-i_dx)
+            w_dy = torch.exp(-i_dy)
+            loss = (torch.abs(d_dx) * w_dx).mean() + (torch.abs(d_dy) * w_dy).mean()
+        else:
+            loss = torch.abs(d_dx).mean() + torch.abs(d_dy).mean()
+
+        return self.weight * loss
+
+
 class MultiScaleDepthLoss(nn.Module):
     """Multi-scale depth loss - computes loss at different resolutions."""
 
-    def __init__(self, scales=(1.0, 0.5, 0.25), edge_weight=0.2, consistency_weight=0.15):
+    def __init__(self, scales=(1.0, 0.5, 0.25), edge_weight=0.2, consistency_weight=0.15, smooth_weight=0.1):
         super().__init__()
         self.scales = scales
         self.silog = SILogLoss()
         self.berhu = BerHuLoss()
         self.edge_loss_fn = MaskEdgeDepthLoss(edge_weight=edge_weight, smooth_weight=0.1)
         self.consistency_fn = MaskConsistencyDepthLoss(weight=consistency_weight)
+        self.smooth_loss_fn = EdgeAwareSmoothnessLoss(weight=smooth_weight)
         self.edge_weight = edge_weight
         self.consistency_weight = consistency_weight
+        self.smooth_weight = smooth_weight
 
-    def forward(self, pred, target, masks=None, batch_idx=None):
+    def forward(self, pred, target, masks=None, batch_idx=None, valid_mask=None, img=None):
         total_loss = 0
         # Ensure target has channel dim for interpolate: (B, H, W) -> (B, 1, H, W)
         if target.ndim == 3:
             target = target.unsqueeze(1)
+        # Ensure valid_mask has channel dim to match pred/target: (B, H, W) -> (B, 1, H, W)
+        if valid_mask is not None and valid_mask.ndim == 3:
+            valid_mask = valid_mask.unsqueeze(1)
         for scale in self.scales:
             if scale != 1.0:
                 pred_s = F.interpolate(pred, scale_factor=scale, mode="bilinear", align_corners=False)
                 target_s = F.interpolate(target, scale_factor=scale, mode="bilinear", align_corners=False)
+                if valid_mask is not None:
+                    valid_mask_s = F.interpolate(valid_mask.float(), scale_factor=scale, mode="nearest") > 0.5
+                else:
+                    valid_mask_s = None
             else:
                 pred_s, target_s = pred, target
-            total_loss += self.silog(pred_s, target_s) + 0.5 * self.berhu(pred_s, target_s)
+                valid_mask_s = valid_mask
+            total_loss += self.silog(pred_s, target_s, valid_mask=valid_mask_s) + 0.5 * self.berhu(pred_s, target_s, valid_mask=valid_mask_s)
         total_loss = total_loss / len(self.scales)
+
+        # Edge-aware smoothness loss: prevent constant-depth predictions
+        if self.smooth_weight > 0:
+            total_loss += self.smooth_loss_fn(pred, img=img)
 
         # Mask edge-aware loss (only at full resolution)
         if masks is not None and batch_idx is not None and self.edge_weight > 0:
@@ -1661,9 +1721,12 @@ class DepthSegmentationLoss(v8SegmentationLoss):
             depth_target = batch.get("depth")
             if depth_target is not None:
                 depth_target = depth_target.to(depth_pred.device)
+                # valid_mask: ignore pixels where depth_target == 0 (missing/invalid depth)
+                valid_mask = depth_target > 0
                 masks = batch.get("masks")
                 batch_idx = batch.get("batch_idx")
-                d_loss = self.depth_loss_fn(depth_pred, depth_target, masks=masks, batch_idx=batch_idx)
+                img = batch.get("img")
+                d_loss = self.depth_loss_fn(depth_pred, depth_target, masks=masks, batch_idx=batch_idx, valid_mask=valid_mask, img=img)
 
                 if self.use_gradnorm:
                     losses = {"seg": seg_loss_val, "depth": d_loss}

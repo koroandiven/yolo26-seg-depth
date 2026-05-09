@@ -335,11 +335,15 @@ class BaseModel(torch.nn.Module):
 
         if preds is None:
             # Cache batch for mask-guided depth head (consumed in forward)
-            if hasattr(self.model[-1], "_cached_batch"):
-                self.model[-1]._cached_batch = batch
-            preds = self.forward(batch["img"])
-            if hasattr(self.model[-1], "_cached_batch"):
-                self.model[-1]._cached_batch = None
+            head = self.model[-1]
+            if hasattr(head, "_cached_batch"):
+                head._cached_batch = batch
+            try:
+                preds = self.forward(batch["img"])
+            finally:
+                # Always clear cached batch to prevent memory leak on exception
+                if hasattr(head, "_cached_batch"):
+                    head._cached_batch = None
         return self.criterion(preds, batch)
 
     def init_criterion(self):

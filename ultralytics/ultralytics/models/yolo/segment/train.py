@@ -18,7 +18,7 @@ class DepthSegmentValidator(SegmentationValidator):
     even when the validation dataset has fewer classes (e.g. NYU depth data)."""
 
     def init_metrics(self, model: torch.nn.Module) -> None:
-        """Initialize metrics with COCO-scale confusion matrix."""
+        """Initialize metrics with COCO-scale confusion matrix and depth metrics."""
         super().init_metrics(model)
         # The model predicts COCO 80 classes but validation data may have fewer.
         # Expand confusion matrix to accommodate all COCO predictions.
@@ -29,6 +29,32 @@ class DepthSegmentValidator(SegmentationValidator):
             self.confusion_matrix = ConfusionMatrix(
                 names={i: str(i) for i in range(self.nc)}, task="detect"
             )
+        # Depth estimation metrics
+        from ultralytics.utils.metrics import DepthMetric
+
+        self.depth_metric = DepthMetric()
+
+    def update_metrics(self, preds, batch):
+        """Update segmentation and depth metrics."""
+        super().update_metrics(preds, batch)
+        # Update depth metrics if depth prediction exists
+        if isinstance(preds, dict) and "depth" in preds:
+            depth_pred = preds["depth"]
+            depth_target = batch.get("depth")
+            if depth_target is not None and depth_pred.shape == depth_target.shape:
+                device = depth_pred.device
+                depth_target = depth_target.to(device)
+                valid_mask = depth_target > 0
+                if valid_mask.any():
+                    self.depth_metric.update(depth_pred[valid_mask], depth_target[valid_mask])
+
+    def get_desc(self):
+        """Return description of validation metrics."""
+        desc = super().get_desc()
+        if hasattr(self, "depth_metric"):
+            depth_results = self.depth_metric.compute()
+            desc += f" | depth_abs_rel:{depth_results['abs_rel']:.3f} depth_rmse:{depth_results['rmse']:.3f}"
+        return desc
 
 
 class SegmentationTrainer(yolo.detect.DetectionTrainer):
@@ -164,6 +190,8 @@ class DepthSegmentTrainer(SegmentationTrainer):
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
         """Build DepthSegmentDataset for multi-task training."""
         gs = max(int(unwrap_model(self.model).stride.max()), 32)
+        # Sync depth_scale from model YAML (or data YAML) to dataset
+        depth_scale = getattr(self.model, "depth_scale", 20.0)
         return DepthSegmentDataset(
             img_path=img_path,
             imgsz=self.args.imgsz,
@@ -179,6 +207,7 @@ class DepthSegmentTrainer(SegmentationTrainer):
             task="segment",
             data=self.data,
             fraction=self.args.fraction if mode == "train" else 1.0,
+            depth_scale=depth_scale,
         )
 
     def validate(self):
@@ -187,6 +216,7 @@ class DepthSegmentTrainer(SegmentationTrainer):
             self.ema.ema.depth_weight = self.depth_weight
             self.ema.ema.use_gradnorm = self.use_gradnorm
             self.ema.ema.freeze_seg = self.freeze_seg
+            self.ema.ema.depth_scale = getattr(self.model, "depth_scale", 20.0)
             if getattr(self.ema.ema, "criterion", None) is None:
                 self.ema.ema.criterion = self.ema.ema.init_criterion()
             elif hasattr(self.ema.ema.criterion, "freeze_seg"):

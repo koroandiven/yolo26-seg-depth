@@ -25,6 +25,12 @@ if local_ultralytics not in sys.path:
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
 
+try:
+    from ultralytics.nn.modules.head import DepthSegment26, Segment26
+except ImportError:
+    DepthSegment26 = None
+    Segment26 = None
+
 
 class YOLO26Inference:
     """YOLO26 推理库封装类
@@ -75,6 +81,7 @@ class YOLO26Inference:
         task: str | None = None,
         device: str = "",
         verbose: bool = False,
+        bypass_seg_branch: bool = False,
     ):
         """初始化 YOLO26 推理器
 
@@ -83,12 +90,15 @@ class YOLO26Inference:
             task: 任务类型，可选: detect, segment, pose, obb。如果为 None，则自动从模型推断
             device: 推理设备，如 'cpu', '0', 'cuda:0'。空字符串则自动选择
             verbose: 是否打印详细信息
+            bypass_seg_branch: 是否绕过 seg_branch（用于旧版深度分割模型）
         """
         self.model_path = str(model_path)
         self._model = None
         self._device = device
         self._task = task
         self._names = None
+        self._bypass_seg_branch = bypass_seg_branch
+        self._has_depth_head = False
         self._load_model(verbose=verbose)
 
     def _load_model(self, verbose: bool = False) -> None:
@@ -97,10 +107,68 @@ class YOLO26Inference:
         if self._task is None:
             self._task = self._model.task
         self._names = self._model.names
+
+        self._patch_depth_head()
+        self._restore_coco_names()
+
         if verbose:
             print(f"模型加载成功: {self.model_path}")
             print(f"任务类型: {self._task}")
             print(f"类别数量: {len(self._names)}")
+            if self._has_depth_head:
+                print(f"深度头已启用 (bypass_seg_branch={self._bypass_seg_branch})")
+
+    def _patch_depth_head(self) -> None:
+        """为 DepthSegment26 模型修补 forward 以支持推理时提取深度"""
+        if DepthSegment26 is None or Segment26 is None:
+            return
+
+        head = self._model.model.model[-1]
+        if not isinstance(head, DepthSegment26):
+            return
+
+        bypass = self._bypass_seg_branch
+        # Save original forward to avoid recursion and support arch evolution
+        _orig_forward = head.forward
+
+        def _instance_forward(x):
+            if getattr(head, "_bypass_seg_branch", False):
+                outputs = Segment26.forward(head, x)
+            else:
+                # Call the *original* DepthSegment26.forward (unpatched).
+                # This guarantees compatibility with both old (exp1-4) and new (exp5+)
+                # decoder architectures since we do not hardcode internals here.
+                outputs = _orig_forward(x)
+            return outputs
+
+        head._bypass_seg_branch = bypass
+        head.forward = _instance_forward
+        self._has_depth_head = True
+
+    def _restore_coco_names(self) -> None:
+        """如果模型保存时使用了错误的 names（如 NYU 10 类），恢复为 COCO 80 类名称"""
+        if not getattr(self, "_has_depth_head", False):
+            return
+
+        try:
+            from ultralytics.nn.tasks import yaml_model_load
+
+            coco_yaml = (
+                Path(__file__).parent
+                / "ultralytics"
+                / "ultralytics"
+                / "cfg"
+                / "datasets"
+                / "coco.yaml"
+            )
+            if coco_yaml.exists():
+                coco_data = yaml_model_load(coco_yaml)
+                names = coco_data.get("names")
+                if names and len(names) == 80:
+                    self._model.model.names = names
+                    self._names = self._model.model.names
+        except Exception:
+            pass
 
     @property
     def model(self) -> YOLO:
@@ -321,46 +389,89 @@ class YOLO26Inference:
         self,
         camera_id: int = 0,
         show: bool = True,
+        show_depth: bool = True,
         save_path: str | Path | None = None,
         window_name: str = "YOLO26 Webcam",
+        depth_window_name: str = "YOLO26 Depth",
+        imgsz: int = 640,
         **kwargs,
     ) -> None:
-        """Webcam 实时推理
+        """Webcam 实时推理，支持分割与深度图同时显示
 
         Args:
             camera_id: 摄像头 ID，默认为 0
             show: 是否显示推理结果窗口
+            show_depth: 是否显示深度图窗口（仅对 DepthSegment26 模型有效）
             save_path: 视频保存路径，如为 None 则不保存
-            window_name: 窗口名称
+            window_name: 分割窗口名称
+            depth_window_name: 深度图窗口名称
+            imgsz: 推理尺寸
             **kwargs: predict() 的其他参数
 
         Example:
-            >>> infer = YOLO26Inference("yolo26s.pt")
-            >>> infer.predict_webcam(0, show=True, conf=0.5)
+            >>> infer = YOLO26Inference("yolo26s-seg-depth.pt", bypass_seg_branch=True)
+            >>> infer.predict_webcam(0, show=True, show_depth=True, conf=0.25)
         """
-        if save_path is not None:
-            kwargs["save"] = True
-            kwargs["project"] = str(Path(save_path).parent)
-            kwargs["name"] = Path(save_path).stem
-
-        kwargs["show"] = show
-        kwargs["stream"] = True
-
         cap = cv2.VideoCapture(camera_id)
         if not cap.isOpened():
             raise ValueError(f"无法打开摄像头 {camera_id}")
 
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        writer = None
+        if save_path is not None:
+            save_path = Path(save_path)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out_w = frame_w * 2 if (show_depth and self._has_depth_head) else frame_w
+            writer = cv2.VideoWriter(str(save_path), fourcc, fps, (out_w, frame_h))
+
+        device = kwargs.get("device", self._device)
+
         try:
-            frame_idx = 0
-            for result in self.predict(source=camera_id, **kwargs):
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                results = self.predict(
+                    source=frame,
+                    stream=False,
+                    imgsz=imgsz,
+                    device=device,
+                    verbose=False,
+                    **kwargs,
+                )
+                result = results[0] if results else None
+
+                if result is not None and result.plot() is not None:
+                    seg_vis = cv2.cvtColor(result.plot(), cv2.COLOR_RGB2BGR)
+                    seg_vis = cv2.resize(seg_vis, (frame_w, frame_h))
+                else:
+                    seg_vis = frame.copy()
+
+                display = seg_vis.copy()
+
+                if show_depth and self._has_depth_head:
+                    depth = self._extract_depth(orig_shape=(frame_h, frame_w))
+                    if depth is not None:
+                        depth_vis = self.visualize_depth(depth)
+                        depth_vis = cv2.resize(depth_vis, (frame_w, frame_h))
+                        display = np.hstack([seg_vis, depth_vis])
+
+                if writer is not None:
+                    writer.write(display)
+
                 if show:
-                    if result.plotted_img is not None:
-                        cv2.imshow(window_name, result.plotted_img)
-                        if cv2.waitKey(1) & 0xFF == ord("q"):
-                            break
-                frame_idx += 1
+                    cv2.imshow(window_name, display)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
         finally:
             cap.release()
+            if writer is not None:
+                writer.release()
             if show:
                 cv2.destroyAllWindows()
 
@@ -502,18 +613,82 @@ class YOLO26Inference:
             return None
         return result.masks.xyn
 
-    def get_depth(self, result: Results) -> np.ndarray | None:
-        """从结果中提取深度图
+    def _extract_depth(self, orig_shape: tuple | None = None) -> np.ndarray | None:
+        """从已 patch 的 DepthSegment26 head 中提取深度图
 
         Args:
-            result: 推理结果对象
+            orig_shape: 原始图像尺寸 (H, W)，提供则 resize 到该尺寸
+
+        Returns:
+            np.ndarray | None: 深度图
+        """
+        if not getattr(self, "_has_depth_head", False):
+            return None
+
+        head = self._model.model.model[-1]
+        if not hasattr(head, "_last_depth") or head._last_depth is None:
+            return None
+
+        depth = head._last_depth.squeeze().cpu().numpy()
+        if orig_shape is not None:
+            depth = cv2.resize(
+                depth,
+                (orig_shape[1], orig_shape[0]),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        return depth
+
+    @staticmethod
+    def visualize_depth(
+        depth: np.ndarray,
+        d_min: float | None = None,
+        d_max: float | None = None,
+        size: tuple | None = None,
+    ) -> np.ndarray:
+        """将深度图可视化为彩色热力图
+
+        Args:
+            depth: 深度图，形状为 (H, W)
+            d_min: 最小深度，为 None 则自动计算
+            d_max: 最大深度，为 None 则自动计算
+            size: 输出尺寸 (W, H)，为 None 则保持原尺寸
+
+        Returns:
+            np.ndarray: BGR 彩色深度可视化图
+        """
+        if size is not None:
+            depth = cv2.resize(depth, size, interpolation=cv2.INTER_LINEAR)
+
+        if d_min is None:
+            d_min = float(depth.min())
+        if d_max is None:
+            d_max = float(depth.max())
+
+        depth_vis = ((depth - d_min) / (d_max - d_min + 1e-8) * 255).astype(np.uint8)
+        depth_color = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+        cv2.putText(
+            depth_color,
+            f"Depth: {d_min:.2f}m - {d_max:.2f}m",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+        )
+        return depth_color
+
+    def get_depth(self, result: Results | None = None) -> np.ndarray | None:
+        """从结果或 head 中提取深度图
+
+        Args:
+            result: 推理结果对象（可选）
 
         Returns:
             np.ndarray | None: 深度图，形状为 (H, W)
         """
-        if hasattr(result, "depth") and result.depth is not None:
+        if result is not None and hasattr(result, "depth") and result.depth is not None:
             return result.depth
-        return None
+        return self._extract_depth()
 
     def to_dict(self, result: Results) -> Dict[str, Any]:
         """将推理结果转换为字典格式
@@ -747,24 +922,153 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="YOLO26 推理库演示")
     parser.add_argument("--model", type=str, default="yolo26s-seg.pt", help="模型路径")
-    parser.add_argument("--source", type=str, default="000046.jpg", help="输入源")
-    parser.add_argument("--conf", type=float, default=0.7, help="置信度阈值")
-    parser.add_argument("--device", type=str, default=0, help="推理设备")
+    parser.add_argument(
+        "--source", type=str, default="000046.jpg", help="输入源（图片或视频路径）"
+    )
+    parser.add_argument("--conf", type=float, default=0.25, help="置信度阈值")
+    parser.add_argument("--device", type=str, default="0", help="推理设备")
+    parser.add_argument("--webcam", action="store_true", help="使用摄像头实时推理")
+    parser.add_argument("--camera-id", type=int, default=0, help="摄像头 ID")
+    parser.add_argument(
+        "--bypass-seg-branch",
+        action="store_true",
+        help="绕过 seg_branch（用于旧版深度分割模型）",
+    )
+    parser.add_argument(
+        "--show-depth", action="store_true", default=True, help="显示深度图"
+    )
+    parser.add_argument("--no-depth", action="store_true", help="不显示深度图")
+    parser.add_argument("--imgsz", type=int, default=640, help="推理尺寸")
+    parser.add_argument("--save", type=str, default=None, help="保存路径")
 
     args = parser.parse_args()
 
+    show_depth = args.show_depth and not args.no_depth
+
     print(f"加载模型: {args.model}")
-    infer = YOLO26Inference(args.model, device=args.device, verbose=True)
-    print(infer.names)
-    print(f"\n对图片进行推理: {args.source}")
-    result = infer.predict_single(
-        args.source, conf=args.conf, verbose=True, save_path="./result.jpg"
+    infer = YOLO26Inference(
+        args.model,
+        device=args.device,
+        verbose=True,
+        bypass_seg_branch=args.bypass_seg_branch,
     )
+    print(infer.names)
 
-    infer.print_summary(result)
+    is_video = Path(args.source).suffix.lower() in {
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".mkv",
+        ".flv",
+        ".wmv",
+        ".webm",
+    }
 
-    detections = infer.to_dict(result)
-    print(f"检测到 {len(detections['class_ids'])} 个目标")
+    if args.webcam:
+        print(
+            f"\n启动摄像头实时推理 (camera_id={args.camera_id}, show_depth={show_depth})"
+        )
+        print("按 'q' 退出")
+        infer.predict_webcam(
+            camera_id=args.camera_id,
+            show=True,
+            show_depth=show_depth,
+            save_path=args.save,
+            conf=args.conf,
+            imgsz=args.imgsz,
+        )
+    elif is_video:
+        print(f"\n对视频进行推理: {args.source}")
+        cap = cv2.VideoCapture(args.source)
+        if not cap.isOpened():
+            raise ValueError(f"无法打开视频: {args.source}")
 
-    if infer.task == "segment" and detections["masks"] is not None:
-        print(f"分割掩码形状: {detections['masks'].shape}")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        save_path = args.save or str(Path(args.source).with_suffix(".result.mp4"))
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out_w = frame_w * 2 if (show_depth and infer._has_depth_head) else frame_w
+        writer = cv2.VideoWriter(str(save_path), fourcc, fps, (out_w, frame_h))
+
+        frame_idx = 0
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                results = infer.predict(
+                    source=frame,
+                    stream=False,
+                    imgsz=args.imgsz,
+                    device=args.device,
+                    verbose=False,
+                    conf=args.conf,
+                )
+                result = results[0] if results else None
+
+                if result is not None and result.plot() is not None:
+                    seg_vis = cv2.cvtColor(result.plot(), cv2.COLOR_RGB2BGR)
+                    seg_vis = cv2.resize(seg_vis, (frame_w, frame_h))
+                else:
+                    seg_vis = frame.copy()
+
+                display = seg_vis.copy()
+
+                if show_depth and infer._has_depth_head:
+                    depth = infer._extract_depth(orig_shape=(frame_h, frame_w))
+                    if depth is not None:
+                        depth_vis = infer.visualize_depth(depth)
+                        depth_vis = cv2.resize(depth_vis, (frame_w, frame_h))
+                        display = np.hstack([seg_vis, depth_vis])
+
+                writer.write(display)
+                # cv2.imshow("YOLO26 Video", display)
+                # if cv2.waitKey(1) & 0xFF == ord("q"):
+                #     break
+
+                frame_idx += 1
+                if frame_idx % 30 == 0 and total > 0:
+                    print(
+                        f"  已处理 {frame_idx}/{total} 帧 ({100 * frame_idx // total}%)"
+                    )
+        finally:
+            cap.release()
+            writer.release()
+            cv2.destroyAllWindows()
+
+        print(f"\n视频推理完成，结果已保存: {save_path}")
+    else:
+        print(f"\n对图片进行推理: {args.source}")
+        result = infer.predict_single(
+            args.source,
+            conf=args.conf,
+            verbose=True,
+            save_path=args.save or "./result.jpg",
+        )
+
+        infer.print_summary(result)
+
+        detections = infer.to_dict(result)
+        print(f"检测到 {len(detections['class_ids'])} 个目标")
+
+        if infer.task == "segment" and detections["masks"] is not None:
+            print(f"分割掩码形状: {detections['masks'].shape}")
+
+        depth = infer.get_depth()
+        if depth is not None:
+            print(
+                f"深度图形状: {depth.shape}, 范围: {depth.min():.2f}m - {depth.max():.2f}m"
+            )
+            if args.save is None:
+                depth_path = "./depth_result.jpg"
+            else:
+                depth_path = str(Path(args.save).with_suffix(".depth.jpg"))
+            depth_vis = infer.visualize_depth(depth)
+            cv2.imwrite(depth_path, depth_vis)
+            print(f"深度图已保存: {depth_path}")

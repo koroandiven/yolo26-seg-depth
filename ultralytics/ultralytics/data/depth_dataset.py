@@ -61,6 +61,7 @@ class DepthSegmentDataset(BaseDataset):
         data: dict | None = None,
         task: str = "segment",
         depth_max: float = 100.0,
+        depth_scale: float = 100.0,
         **kwargs,
     ):
         """Initialize DepthSegmentDataset.
@@ -68,7 +69,8 @@ class DepthSegmentDataset(BaseDataset):
         Args:
             data: Dataset configuration dictionary with paths
             task: Task type, "segment" for depth+segment
-            depth_max: Maximum depth value in meters for normalization
+            depth_max: Maximum raw depth value in meters (for clipping loaded depth)
+            depth_scale: Scale factor to normalize depth targets to [0, depth_scale]
             *args: Additional positional arguments for parent class
             **kwargs: Additional keyword arguments for parent class
         """
@@ -76,6 +78,7 @@ class DepthSegmentDataset(BaseDataset):
         self.use_keypoints = False
         self.use_obb = False
         self.depth_max = depth_max
+        self.depth_scale = depth_scale
         self.data = data
         super().__init__(*args, channels=3, **kwargs)
 
@@ -287,7 +290,8 @@ class DepthSegmentDataset(BaseDataset):
             depth_file: Path to 16-bit PNG depth file
 
         Returns:
-            Depth map in meters, shape (H, W)
+            Normalized depth map, shape (H, W), range [0, depth_scale]
+            (0 indicates missing/invalid depth)
         """
         if not depth_file or not Path(depth_file).exists():
             return np.zeros((self.imgsz, self.imgsz), dtype=np.float32)
@@ -296,6 +300,8 @@ class DepthSegmentDataset(BaseDataset):
         if depth is None:
             return np.zeros((self.imgsz, self.imgsz), dtype=np.float32)
 
+        # Convert from mm to meters, clip outliers
+        # Target stays in raw meters to match model output (sigmoid * depth_scale)
         depth = depth.astype(np.float32) / 1000.0
         depth = np.clip(depth, 0, self.depth_max)
         return depth

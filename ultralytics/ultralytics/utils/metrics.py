@@ -1565,10 +1565,12 @@ class DepthMetric:
 
     def update(self, pred, target):
         """Update metrics."""
+        pred = pred.float().clamp_min(1e-3)
+        target = target.float().clamp_min(1e-3)
         diff = pred - target
         abs_rel = torch.mean(torch.abs(diff) / (target + 1e-8)).item()
         rmse = torch.sqrt(torch.mean(diff.pow(2))).item()
-        log_diff = torch.log(pred + 1e-8) - torch.log(target + 1e-8)
+        log_diff = torch.log(pred) - torch.log(target)
         silog = torch.sqrt(torch.mean(log_diff.pow(2)) - torch.mean(log_diff).pow(2)).item()
 
         self.abs_rel.append(abs_rel)

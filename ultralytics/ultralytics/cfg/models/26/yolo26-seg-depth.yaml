@@ -8,6 +8,7 @@
 nc: 80 # number of classes
 depth_nc: 1 # depth channels
 depth_scale: 20.0 # depth output range in meters (NYU indoor scenes ~0-10m)
+decouple_p4p5: False # disable P4/P5 task decoupling to fix spatial bias and box_loss
 end2end: True # whether to use end-to-end mode
 reg_max: 1 # DFL bins
 scales: # model compound scaling constants

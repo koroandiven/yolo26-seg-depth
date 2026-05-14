@@ -34,16 +34,38 @@ class DepthSegmentValidator(SegmentationValidator):
 
         self.depth_metric = DepthMetric()
 
+    def postprocess(self, preds):
+        """Post-process predictions and preserve depth for metric update."""
+        # Extract depth before NMS/postprocess strips it (preds is ((y, proto), preds_dict))
+        self._last_depth_pred = None
+        if isinstance(preds, tuple) and len(preds) == 2 and isinstance(preds[1], dict):
+            self._last_depth_pred = preds[1].get("depth")
+        return super().postprocess(preds)
+
     def update_metrics(self, preds, batch):
         """Update segmentation and depth metrics."""
         super().update_metrics(preds, batch)
-        # Update depth metrics if depth prediction exists
-        if isinstance(preds, dict) and "depth" in preds:
-            depth_pred = preds["depth"]
+        # Update depth metrics if depth prediction was captured in postprocess
+        depth_pred = getattr(self, "_last_depth_pred", None)
+        if depth_pred is not None:
             depth_target = batch.get("depth")
-            if depth_target is not None and depth_pred.shape == depth_target.shape:
+            if depth_target is not None:
                 device = depth_pred.device
                 depth_target = depth_target.to(device)
+                # Handle shape mismatch: depth_pred is (B,1,H,W), depth_target is (B,H,W)
+                if depth_pred.dim() == 4 and depth_target.dim() == 3:
+                    depth_pred = depth_pred.squeeze(1)
+                elif depth_pred.dim() == 4 and depth_target.dim() == 4:
+                    depth_target = depth_target.squeeze(1)
+                # Resize depth_target to match depth_pred if sizes differ (rect mode)
+                if depth_pred.shape != depth_target.shape:
+                    import torch.nn.functional as F
+                    depth_target = F.interpolate(
+                        depth_target.unsqueeze(1),
+                        size=depth_pred.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(1)
                 valid_mask = depth_target > 0
                 if valid_mask.any():
                     self.depth_metric.update(depth_pred[valid_mask], depth_target[valid_mask])
@@ -178,9 +200,10 @@ class DepthSegmentTrainer(SegmentationTrainer):
             for m in seg_head.modules():
                 if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.SyncBatchNorm)):
                     m.eval()
-            # Only freeze seg detection/segmentation params (NOT depth components)
+            # Only freeze seg detection/segmentation params (NOT depth components).
+            # Keep task_attention.seg_branch frozen to preserve the COCO seg path.
             for n, p in seg_head.named_parameters():
-                if "depth" in n or "task_attention" in n:
+                if "depth" in n or "task_attention.depth_branch" in n:
                     p.requires_grad = True  # depth components always trainable
                 else:
                     p.requires_grad = False  # cv2/cv3/cv4/cv5/proto/dfl frozen

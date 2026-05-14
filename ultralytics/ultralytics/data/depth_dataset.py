@@ -14,6 +14,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 import os
+import random
 import torch
 from pathlib import Path
 from typing import Any
@@ -22,12 +23,51 @@ from ultralytics.utils import LOCAL_RANK, LOGGER, TQDM
 from ultralytics.utils.instance import Instances
 from ultralytics.utils.ops import resample_segments, segments2boxes
 
-from .augment import Compose, Format, LetterBox, v8_transforms
+from .augment import Compose, Format, LetterBox, RandomHSV
 from .base import BaseDataset
 from .utils import get_hash, img2label_paths, load_dataset_cache_file, save_dataset_cache_file
 
 
 DATASET_CACHE_VERSION = "1.0.3"
+
+
+class DepthRandomFlip:
+    """Horizontal flip that also mirrors the dense depth target.
+
+    The stock ``RandomFlip`` augmentation in Ultralytics only flips the image
+    and the instance annotations, leaving ``label["depth"]`` (a dense per-pixel
+    target) untouched. That mismatch would teach the depth head the wrong
+    correspondence, so we wrap the flip and apply it to depth too.
+
+    Only horizontal flip is supported on purpose: vertical flip would invert
+    floor/ceiling geometry which depth cannot reconcile.
+    """
+
+    def __init__(self, p: float = 0.5):
+        assert 0.0 <= p <= 1.0
+        self.p = p
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        if random.random() >= self.p:
+            return labels
+
+        img = labels["img"]
+        instances = labels.pop("instances", None)
+        h, w = img.shape[:2]
+        if instances is not None:
+            instances.convert_bbox(format="xywh")
+            w_for_flip = 1 if instances.normalized else w
+            instances.fliplr(w_for_flip)
+            labels["instances"] = instances
+
+        labels["img"] = np.ascontiguousarray(np.fliplr(img))
+
+        depth = labels.get("depth")
+        if depth is not None:
+            labels["depth"] = np.ascontiguousarray(np.fliplr(depth))
+
+        return labels
+
 
 
 class DepthSegmentDataset(BaseDataset):
@@ -149,7 +189,7 @@ class DepthSegmentDataset(BaseDataset):
             pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds"
         pbar.close()
 
-        x["hash"] = get_hash(self.label_files + self.im_files)
+        x["hash"] = get_hash(self.label_files + self.im_files + self.depth_files)
         x["results"] = nf, nm, ne, nc, len(self.im_files)
         if x["labels"]:
             save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
@@ -224,7 +264,7 @@ class DepthSegmentDataset(BaseDataset):
         try:
             cache, exists = load_dataset_cache_file(cache_path), True
             assert cache["version"] == DATASET_CACHE_VERSION
-            assert cache["hash"] == get_hash(self.label_files + self.im_files)
+            assert cache["hash"] == get_hash(self.label_files + self.im_files + self.depth_files)
         except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
             cache, exists = self.cache_labels(cache_path), False
 
@@ -244,9 +284,16 @@ class DepthSegmentDataset(BaseDataset):
     def build_transforms(self, hyp: dict | None = None) -> Compose:
         """Build and append transforms to the list."""
         if self.augment:
-            # Mosaic augmentation drops the 'depth' key; disable it for depth training
-            hyp.mosaic = 0.0
-            transforms = v8_transforms(self, self.imgsz, hyp)
+            # Depth is a dense pixel target. Disable spatial augmentations that do not
+            # transform depth identically to the image, but keep safe color jitter
+            # and a depth-aware horizontal flip (essential to avoid left/right bias).
+            fliplr_p = float(getattr(hyp, "fliplr", 0.5)) if hyp is not None else 0.5
+            transforms_list = [
+                LetterBox(new_shape=(self.imgsz, self.imgsz)),
+                DepthRandomFlip(p=fliplr_p),
+                RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
+            ]
+            transforms = Compose(transforms_list)
         else:
             transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
 
@@ -306,6 +353,35 @@ class DepthSegmentDataset(BaseDataset):
         depth = np.clip(depth, 0, self.depth_max)
         return depth
 
+    @staticmethod
+    def _letterbox_depth(depth: np.ndarray, labels: dict) -> np.ndarray:
+        """Apply the same LetterBox geometry as the image transform to a depth map.
+
+        Depth values are dense supervision in meters. Padding is set to 0 so the
+        existing valid mask (depth > 0) excludes padded regions from depth loss.
+        """
+        img = labels["img"]
+        shape = depth.shape[:2]
+        new_shape = labels.get("rect_shape", labels.get("depth_new_shape", (img.shape[0], img.shape[1])))
+        if isinstance(new_shape, int):
+            new_shape = (new_shape, new_shape)
+
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        if labels.get("depth_scaleup") is False:
+            r = min(r, 1.0)
+
+        new_unpad = round(shape[1] * r), round(shape[0] * r)
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+        dw /= 2
+        dh /= 2
+
+        if shape[::-1] != new_unpad:
+            depth = cv2.resize(depth, new_unpad, interpolation=cv2.INTER_LINEAR)
+
+        top, bottom = round(dh - 0.1), round(dh + 0.1)
+        left, right = round(dw - 0.1), round(dw + 0.1)
+        return cv2.copyMakeBorder(depth, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0).astype(np.float32)
+
     def __getitem__(self, index: int) -> dict:
         """Get transformed item from the dataset."""
         label = self.get_image_and_label(index)
@@ -317,19 +393,20 @@ class DepthSegmentDataset(BaseDataset):
         else:
             depth = np.zeros((h0, w0), dtype=np.float32)
 
-        # Resize depth to match resized image shape from load_image
+        # Resize depth to match resized image shape from load_image. LetterBox is
+        # applied below with the same target shape as the image transform.
         if depth.shape[:2] != label["resized_shape"]:
             depth = cv2.resize(depth, (label["resized_shape"][1], label["resized_shape"][0]), interpolation=cv2.INTER_LINEAR)
-        label["depth"] = depth
+
+        # Store a depth map already aligned to the post-LetterBox image. Standard
+        # Ultralytics transforms do not know how to transform dense depth targets.
+        label["depth_new_shape"] = (self.imgsz, self.imgsz)
+        label["depth_scaleup"] = self.augment
+        label["depth"] = self._letterbox_depth(depth, label)
 
         label = self.transforms(label)
-
-        # Ensure depth is numpy array before potential resize
-        if "depth" in label and isinstance(label["depth"], np.ndarray):
-            if label["depth"].shape[:2] != (self.imgsz, self.imgsz):
-                label["depth"] = cv2.resize(
-                    label["depth"], (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR
-                )
+        label.pop("depth_scaleup", None)
+        label.pop("depth_new_shape", None)
 
         # Remove any None-valued keys to prevent collate_fn issues
         for k in list(label.keys()):

@@ -1267,7 +1267,9 @@ class SILogLoss(nn.Module):
         self.beta = beta
 
     def forward(self, pred, target, valid_mask=None):
-        diff = torch.log(pred + 1e-8) - torch.log(target + 1e-8)
+        pred = pred.float().clamp_min(1e-3)
+        target = target.float().clamp_min(1e-3)
+        diff = torch.log(pred) - torch.log(target)
         if valid_mask is not None:
             diff = diff[valid_mask]
         n = diff.numel()
@@ -1285,6 +1287,8 @@ class BerHuLoss(nn.Module):
         self.threshold = threshold
 
     def forward(self, pred, target, valid_mask=None):
+        pred = pred.float()
+        target = target.float()
         diff = torch.abs(pred - target)
         if valid_mask is not None:
             diff = diff[valid_mask]
@@ -1371,8 +1375,8 @@ class MaskEdgeDepthLoss(nn.Module):
             [B, 1, H, W] gradient magnitude
         """
         device = depth.device
-        # Kernel dtype must be float regardless of input dtype
-        kernel_dtype = torch.float32
+        # Match kernel dtype to input dtype for AMP/FP16 compatibility
+        kernel_dtype = depth.dtype
         sobel_x = torch.tensor(
             [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
             device=device, dtype=kernel_dtype,
@@ -1567,10 +1571,72 @@ class EdgeAwareSmoothnessLoss(nn.Module):
         return self.weight * loss
 
 
+class ImageEdgeAlignmentLoss(nn.Module):
+    """Encourage depth gradients to align with image edges.
+
+    Unlike :class:`MaskEdgeDepthLoss`, this term needs no GT masks and is
+    therefore active at training, validation, and inference time. It
+    minimises ``image_edge * exp(-k * depth_grad)``: wherever the RGB image
+    has a strong edge but the predicted depth is flat the penalty grows, so
+    the network is encouraged to put depth discontinuities along image edges.
+    """
+
+    def __init__(self, weight: float = 0.2, k: float = 3.0, edge_thr: float = 0.04):
+        super().__init__()
+        self.weight = weight
+        self.k = k
+        self.edge_thr = edge_thr
+
+    def forward(self, depth: torch.Tensor, img: torch.Tensor | None) -> torch.Tensor:
+        if img is None or self.weight <= 0.0:
+            return torch.tensor(0.0, device=depth.device, dtype=depth.dtype)
+
+        # Make sure shapes line up.
+        if img.shape[-2:] != depth.shape[-2:]:
+            img = F.interpolate(img.float(), size=depth.shape[-2:], mode="bilinear", align_corners=False)
+
+        img = img.float()
+        if img.max() > 1.5:  # 0-255 input
+            img = img / 255.0
+
+        lum = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
+
+        kernel_dtype = depth.dtype
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            device=depth.device, dtype=kernel_dtype,
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            device=depth.device, dtype=kernel_dtype,
+        ).view(1, 1, 3, 3)
+
+        ix = F.conv2d(lum.to(kernel_dtype), sobel_x, padding=1).abs()
+        iy = F.conv2d(lum.to(kernel_dtype), sobel_y, padding=1).abs()
+        img_edge = (ix + iy)
+        # Soft thresholding: ignore weak texture so the loss focuses on
+        # genuine object boundaries.
+        img_edge = (img_edge - self.edge_thr).clamp(min=0.0)
+
+        dx = F.conv2d(depth, sobel_x, padding=1).abs()
+        dy = F.conv2d(depth, sobel_y, padding=1).abs()
+        depth_grad = dx + dy
+
+        align = img_edge * torch.exp(-self.k * depth_grad)
+        return self.weight * align.mean()
+
+
 class MultiScaleDepthLoss(nn.Module):
     """Multi-scale depth loss - computes loss at different resolutions."""
 
-    def __init__(self, scales=(1.0, 0.5, 0.25), edge_weight=0.2, consistency_weight=0.15, smooth_weight=0.1):
+    def __init__(
+        self,
+        scales=(1.0, 0.5, 0.25),
+        edge_weight=0.6,
+        consistency_weight=0.05,
+        smooth_weight=0.1,
+        image_edge_weight=0.2,
+    ):
         super().__init__()
         self.scales = scales
         self.silog = SILogLoss()
@@ -1578,9 +1644,11 @@ class MultiScaleDepthLoss(nn.Module):
         self.edge_loss_fn = MaskEdgeDepthLoss(edge_weight=edge_weight, smooth_weight=0.1)
         self.consistency_fn = MaskConsistencyDepthLoss(weight=consistency_weight)
         self.smooth_loss_fn = EdgeAwareSmoothnessLoss(weight=smooth_weight)
+        self.image_edge_fn = ImageEdgeAlignmentLoss(weight=image_edge_weight)
         self.edge_weight = edge_weight
         self.consistency_weight = consistency_weight
         self.smooth_weight = smooth_weight
+        self.image_edge_weight = image_edge_weight
 
     def forward(self, pred, target, masks=None, batch_idx=None, valid_mask=None, img=None):
         total_loss = 0
@@ -1590,6 +1658,11 @@ class MultiScaleDepthLoss(nn.Module):
         # Ensure valid_mask has channel dim to match pred/target: (B, H, W) -> (B, 1, H, W)
         if valid_mask is not None and valid_mask.ndim == 3:
             valid_mask = valid_mask.unsqueeze(1)
+        # Rect validation: pred and target may have different spatial sizes.
+        if pred.shape[-2:] != target.shape[-2:]:
+            target = F.interpolate(target, size=pred.shape[-2:], mode="bilinear", align_corners=False)
+            if valid_mask is not None:
+                valid_mask = F.interpolate(valid_mask.float(), size=pred.shape[-2:], mode="nearest") > 0.5
         for scale in self.scales:
             if scale != 1.0:
                 pred_s = F.interpolate(pred, scale_factor=scale, mode="bilinear", align_corners=False)
@@ -1608,7 +1681,11 @@ class MultiScaleDepthLoss(nn.Module):
         if self.smooth_weight > 0:
             total_loss += self.smooth_loss_fn(pred, img=img)
 
-        # Mask edge-aware loss (only at full resolution)
+        # Image-edge alignment (no GT masks required; active at train + val).
+        if self.image_edge_weight > 0:
+            total_loss += self.image_edge_fn(pred, img)
+
+        # Mask edge-aware loss (only when GT masks available, training time)
         if masks is not None and batch_idx is not None and self.edge_weight > 0:
             total_loss += self.edge_loss_fn(pred, masks, batch_idx)
 
@@ -1676,7 +1753,13 @@ class DepthSegmentationLoss(v8SegmentationLoss):
         self.use_gradnorm = use_gradnorm
         self.depth_weight = depth_weight
         self.freeze_seg = freeze_seg
-        self.depth_loss_fn = MultiScaleDepthLoss(scales=(1.0, 0.5), edge_weight=0.2)
+        self.depth_loss_fn = MultiScaleDepthLoss(
+            scales=(1.0, 0.5),
+            edge_weight=0.6,
+            consistency_weight=0.05,
+            smooth_weight=0.1,
+            image_edge_weight=0.2,
+        )
         self._loss_names = ["box", "seg", "cls", "dfl", "semseg", "depth"]
         self.updates = 0  # for resume compatibility with end2end training
 
@@ -1701,6 +1784,11 @@ class DepthSegmentationLoss(v8SegmentationLoss):
         Returns:
             tuple: (total_loss, loss_items) where loss_items = [box, seg, cls, dfl, semseg, depth]
         """
+        # Eval mode: preds may be a tuple ((y, proto), preds_dict) from Segment26.
+        # Extract the preds_dict which contains the depth key.
+        if isinstance(preds, tuple) and len(preds) == 2 and isinstance(preds[1], dict):
+            preds = preds[1]
+
         # Handle end2end nested dict: extract one2many for segmentation loss
         seg_preds = preds
         if isinstance(preds, dict) and "one2many" in preds:

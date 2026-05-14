@@ -1865,14 +1865,19 @@ class DepthResidualBlock(nn.Module):
 
 
 class MaskGuidedDepthDecoder(nn.Module):
-    """Multi-scale depth decoder with expanded capacity and weak mask guidance.
+    """Multi-scale depth decoder with soft-mask guidance via FiLM modulation.
 
-    Mask guidance is used ONLY for edge hints (where object boundaries are),
-    not for enforcing uniform depth inside objects. This prevents the model
-    from "cheating" by outputting a constant depth per mask region.
+    Guidance input is a 2-channel ``[soft_union, soft_edge]`` tensor derived
+    from the segmentation head's predicted mask logits. The encoder produces
+    a ``(gamma, beta)`` pair that modulates the depth feature multiplicatively
+    so the decoder cannot trivially ignore the segmentation signal.
+
+    For backward compatibility the decoder also accepts a single-channel proto
+    tensor (treated as a generic feature map) when the channel count matches
+    ``seg_guidance_ch``.
     """
 
-    def __init__(self, ch, c_depth=128):
+    def __init__(self, ch, c_depth=128, seg_guidance_ch=32):
         super().__init__()
         c3, c4, c5 = ch[0], ch[1], ch[2]  # P3/8, P4/16, P5/32
 
@@ -1887,17 +1892,42 @@ class MaskGuidedDepthDecoder(nn.Module):
         )
         self.depth_p3 = nn.Conv2d(c3, c_depth, 1)
 
-        # Mask guidance encoder: 2ch [occupancy, edge] -> c_depth
-        # Only edge channel is used for depth discontinuity hints
+        # ---- Soft mask guidance branch ----------------------------------
+        # Input: 2 channels = [soft_union_mask, soft_edge_magnitude]
+        # Output: 2 * c_depth channels split into (gamma, beta) for FiLM.
+        # gamma_head is zero-initialised so FiLM starts as identity, which
+        # keeps early training stable even before the segmentation head
+        # produces meaningful masks.
+        self.guidance_in_ch = 2
+        self.guidance_encoder = nn.Sequential(
+            DepthConv(self.guidance_in_ch, c_depth // 4, 3),
+            DepthConv(c_depth // 4, c_depth // 2, 3),
+            DepthConv(c_depth // 2, c_depth, 3),
+        )
+        self.gamma_head = nn.Conv2d(c_depth, c_depth, kernel_size=1, bias=True)
+        self.beta_head = nn.Conv2d(c_depth, c_depth, kernel_size=1, bias=True)
+        nn.init.zeros_(self.gamma_head.weight)
+        nn.init.zeros_(self.gamma_head.bias)
+        nn.init.zeros_(self.beta_head.weight)
+        nn.init.zeros_(self.beta_head.bias)
+
+        # Retain the old encoder names for checkpoint loading compatibility.
+        # They are unused at runtime but allow exp7/exp8/exp12 checkpoints
+        # to load without strict-mode failures when ``load(strict=False)``.
         self.mask_encoder = nn.Sequential(
             DepthConv(2, c_depth // 4, 3),
             DepthConv(c_depth // 4, c_depth // 2, 3),
         )
+        self.seg_guidance_ch = seg_guidance_ch
+        self.depth_guidance_encoder = nn.Sequential(
+            DepthConv(seg_guidance_ch, c_depth // 4, 3),
+            DepthConv(c_depth // 4, c_depth // 2, 3),
+        )
 
-        # Fusion: P5 + P4 + P3 + weak mask_feat
-        self.fusion_in = DepthConv(c_depth * 3 + c_depth // 2, c_depth, k=3)
+        # Fusion: P5 + P4 + P3 only; guidance is injected via FiLM after fusion.
+        self.fusion_in = DepthConv(c_depth * 3, c_depth, k=3)
 
-        # Deep refinement with residual blocks (expanded capacity)
+        # Deep refinement with residual blocks
         self.refine_blocks = nn.Sequential(
             DepthResidualBlock(c_depth),
             DepthResidualBlock(c_depth),
@@ -1917,11 +1947,46 @@ class MaskGuidedDepthDecoder(nn.Module):
             nn.Conv2d(16, 1, kernel_size=1, bias=True),
         )
 
-        # Learnable spatial bias correction (regularized toward zero)
-        self.bias_correction = SpatialBiasCorrection(size=80)
+        # SpatialBiasCorrection has been removed (was unregularised and was
+        # actively memorising the NYU left/right asymmetry). Older checkpoints
+        # may still contain its parameters; they will be reported as
+        # "unexpected" keys by ``load(strict=False)`` and ignored.
 
-        # Learnable default mask feature when no guidance is available
+        # Learnable default FiLM offsets used when no guidance is supplied.
+        self.default_film_gamma = nn.Parameter(torch.zeros(1, c_depth, 1, 1))
+        self.default_film_beta = nn.Parameter(torch.zeros(1, c_depth, 1, 1))
+        # Retained for checkpoint compatibility (unused at runtime).
         self.default_mask_feat = nn.Parameter(torch.zeros(1, c_depth // 2, 1, 1))
+
+    def _compute_film(self, mask_guidance, ref_shape):
+        """Compute ``(gamma, beta)`` FiLM tensors at depth feature resolution.
+
+        Args:
+            mask_guidance: Optional ``[B, 2, H, W]`` soft mask + edge tensor.
+            ref_shape: Tuple ``(B, C, H, W)`` of the depth feature to modulate.
+        """
+        B, C, H, W = ref_shape
+        if mask_guidance is None:
+            gamma = self.default_film_gamma.expand(B, -1, H, W)
+            beta = self.default_film_beta.expand(B, -1, H, W)
+            return gamma, beta
+
+        if mask_guidance.shape[1] != self.guidance_in_ch:
+            # Unexpected channel count: fall back to default.
+            gamma = self.default_film_gamma.expand(B, -1, H, W)
+            beta = self.default_film_beta.expand(B, -1, H, W)
+            return gamma, beta
+
+        if mask_guidance.shape[-2:] != (H, W):
+            mask_guidance = F.interpolate(
+                mask_guidance, size=(H, W), mode="bilinear", align_corners=False
+            )
+        # Detach again to be safe (call site already detaches, but FiLM must
+        # never leak depth gradients into the segmentation head).
+        feat = self.guidance_encoder(mask_guidance.detach())
+        gamma = self.gamma_head(feat)
+        beta = self.beta_head(feat)
+        return gamma, beta
 
     def forward(self, features, mask_guidance=None):
         p3, p4, p5 = features[0], features[1], features[2]
@@ -1930,60 +1995,165 @@ class MaskGuidedDepthDecoder(nn.Module):
         d_p4 = self.depth_p4(p4)
         d_p3 = self.depth_p3(p3)
 
+        if isinstance(mask_guidance, (tuple, list)):
+            mask_guidance = mask_guidance[0] if mask_guidance else None
         if mask_guidance is not None:
-            # Resize mask to P3 resolution
-            if mask_guidance.shape[-2:] != d_p3.shape[-2:]:
-                mask_guidance = F.interpolate(
-                    mask_guidance, size=d_p3.shape[-2:], mode="nearest"
-                )
-            mask_feat = self.mask_encoder(mask_guidance)
-            # Apply a small weight to mask_feat so the model cannot
-            # "cheat" by relying too heavily on mask guidance.
-            mask_feat = mask_feat * 0.3
-        else:
-            # Use learnable default mask feature
-            mask_feat = self.default_mask_feat.expand(
-                d_p3.size(0), -1, d_p3.size(2), d_p3.size(3)
-            )
+            mask_guidance = mask_guidance.detach()
 
-        # Concatenate all features (P3/P4/P5 + weak mask)
-        fused = torch.cat([d_p5, d_p4, d_p3, mask_feat], dim=1)
+        # Concatenate all multi-scale features (no guidance concat here).
+        fused = torch.cat([d_p5, d_p4, d_p3], dim=1)
         depth_feat = self.fusion_in(fused)
+
+        # FiLM-modulate the depth feature with guidance-derived (gamma, beta).
+        gamma, beta = self._compute_film(mask_guidance, depth_feat.shape)
+        depth_feat = depth_feat * (1.0 + gamma) + beta
+
         depth_feat = self.refine_blocks(depth_feat)
         depth_feat = self.fusion_out(depth_feat)
         depth = self.depth_head(depth_feat)
         depth = self.depth_up(depth)
         depth = self.depth_refine(depth)
-        # Apply learnable spatial bias correction (removes dataset-level
-        # positional bias such as "top-left always deeper" or "left half
-        # always farther" that the model may have memorised)
-        bias_corr = getattr(self, "bias_correction", None)
-        if bias_corr is not None:
-            depth = bias_corr(depth)
         return depth
 
 
 class DepthSegment26(Segment26):
     """YOLO26 Segment + Depth multi-task head (with decoupling attention + mask-guided depth)."""
 
-    def __init__(self, nc=80, nm=32, npr=256, reg_max=16, end2end=False, ch=(), depth_scale=100.0):
+    def __init__(self, nc=80, nm=32, npr=256, reg_max=16, end2end=False, ch=(), depth_scale=100.0, decouple_p4p5=True):
         super().__init__(nc, nm, npr, reg_max, end2end, ch)
 
         self.depth_scale = depth_scale
+        self.decouple_p4p5 = decouple_p4p5
 
         # Task decoupling attention for P3 (main depth feature)
         self.task_attention = TaskDecouplingAttention(ch[0])
 
         # Light task decoupling for P4/P5 to reduce segmentation bias in depth path
+        # Always create modules for checkpoint compatibility, but forward can skip them
         self.task_attention_p4 = TaskDecouplingAttention(ch[1]) if len(ch) > 1 else None
         self.task_attention_p5 = TaskDecouplingAttention(ch[2]) if len(ch) > 2 else None
 
         # Mask-guided depth decoder
         c_depth = max(ch[0] // 2, 128)
-        self.mask_guided_depth_decoder = MaskGuidedDepthDecoder(ch, c_depth)
+        self.mask_guided_depth_decoder = MaskGuidedDepthDecoder(ch, c_depth, seg_guidance_ch=nm)
 
         # Batch cache for training mask guidance (set by BaseModel.loss)
         self._cached_batch = None
+
+    @staticmethod
+    def _extract_seg_guidance(outputs, top_k: int = 16, score_thr: float = 0.05):
+        """Build soft mask union + edge guidance from predicted segmentation outputs.
+
+        Strategy:
+            1. Locate the proto tensor (``[B, nm, Hp, Wp]``) and the predicted
+               mask coefficients (``[B, nm, A]`` from ``forward_head``) along
+               with class scores (``[B, nc, A]``).
+            2. For each image take the top-K anchors by max class score, mask
+               out very-low-score predictions, and compute soft instance masks
+               via ``sigmoid(MC @ proto)``.
+            3. Union them with a soft-OR (``1 - prod(1 - m)``) and compute a
+               Sobel-magnitude edge map.
+
+        Returns:
+            ``[B, 2, Hp, Wp]`` tensor with channels ``[soft_union, soft_edge]``,
+            detached from the segmentation graph; or ``None`` if the outputs
+            don't expose enough information.
+        """
+
+        def first_proto(proto):
+            if isinstance(proto, (tuple, list)):
+                proto = proto[0] if proto else None
+            return proto if isinstance(proto, torch.Tensor) else None
+
+        # ---- Locate proto and a head dict that contains mask_coefficient ----
+        proto = None
+        head_dict = None
+        if isinstance(outputs, dict):
+            # Training paths
+            if "one2one" in outputs and isinstance(outputs["one2one"], dict):
+                proto = first_proto(outputs["one2one"].get("proto"))
+                if "mask_coefficient" in outputs["one2one"]:
+                    head_dict = outputs["one2one"]
+            if proto is None and "one2many" in outputs and isinstance(outputs["one2many"], dict):
+                proto = first_proto(outputs["one2many"].get("proto"))
+                if head_dict is None and "mask_coefficient" in outputs["one2many"]:
+                    head_dict = outputs["one2many"]
+            if proto is None:
+                proto = first_proto(outputs.get("proto"))
+                if head_dict is None and "mask_coefficient" in outputs:
+                    head_dict = outputs
+        elif isinstance(outputs, tuple):
+            # Eval path: ((y, proto), preds_dict)
+            first = outputs[0] if len(outputs) else None
+            if isinstance(first, tuple) and len(first) > 1:
+                proto = first_proto(first[1])
+            preds_dict = outputs[1] if len(outputs) > 1 else None
+            if isinstance(preds_dict, dict):
+                if "one2one" in preds_dict and isinstance(preds_dict["one2one"], dict) and "mask_coefficient" in preds_dict["one2one"]:
+                    head_dict = preds_dict["one2one"]
+                elif "one2many" in preds_dict and isinstance(preds_dict["one2many"], dict) and "mask_coefficient" in preds_dict["one2many"]:
+                    head_dict = preds_dict["one2many"]
+                elif "mask_coefficient" in preds_dict:
+                    head_dict = preds_dict
+
+        if proto is None:
+            return None
+
+        # If we cannot find mask coefficients (e.g. fused inference path),
+        # return a zero guidance map. This keeps the FiLM modulator on its
+        # learned default behaviour without introducing NaNs.
+        proto = proto.detach()
+        B, nm, Hp, Wp = proto.shape
+        if head_dict is None or "mask_coefficient" not in head_dict or "scores" not in head_dict:
+            return torch.zeros(B, 2, Hp, Wp, device=proto.device, dtype=proto.dtype)
+
+        mc = head_dict["mask_coefficient"].detach()  # [B, nm, A]
+        scores = head_dict["scores"].detach()  # [B, nc, A]
+        if mc.shape[1] != nm:
+            return torch.zeros(B, 2, Hp, Wp, device=proto.device, dtype=proto.dtype)
+
+        # Per-anchor max class score (after sigmoid -> [0, 1]).
+        cls_max = scores.sigmoid().max(dim=1).values  # [B, A]
+        A = cls_max.shape[1]
+        k = min(top_k, A)
+
+        topk_scores, topk_idx = cls_max.topk(k, dim=1)  # [B, k]
+        # Gather corresponding mask coefficients: [B, nm, k]
+        mc_top = mc.gather(2, topk_idx.unsqueeze(1).expand(-1, nm, -1))
+
+        # Compute soft masks: sigmoid(mc^T @ proto)
+        # mc_top: [B, nm, k] -> [B, k, nm]
+        # proto: [B, nm, Hp, Wp] -> [B, nm, Hp*Wp]
+        proto_flat = proto.view(B, nm, Hp * Wp)
+        soft_logits = torch.bmm(mc_top.transpose(1, 2), proto_flat)  # [B, k, Hp*Wp]
+        soft_masks = torch.sigmoid(soft_logits).view(B, k, Hp, Wp)
+
+        # Suppress low-score anchors (multiplicative, keeps gradient-free).
+        score_gate = (topk_scores > score_thr).to(soft_masks.dtype).view(B, k, 1, 1)
+        soft_masks = soft_masks * score_gate
+
+        # Soft union: 1 - prod(1 - m_i)
+        log_one_minus = torch.log1p(-soft_masks.clamp(max=0.999))  # [B, k, Hp, Wp]
+        union = 1.0 - torch.exp(log_one_minus.sum(dim=1, keepdim=True))  # [B, 1, Hp, Wp]
+        union = union.clamp(0.0, 1.0)
+
+        # Sobel magnitude edge map of the union.
+        device = union.device
+        dtype = union.dtype
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            device=device, dtype=dtype,
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            device=device, dtype=dtype,
+        ).view(1, 1, 3, 3)
+        ex = F.conv2d(union, sobel_x, padding=1).abs()
+        ey = F.conv2d(union, sobel_y, padding=1).abs()
+        edge = (ex + ey).clamp(0.0, 1.0)
+
+        guidance = torch.cat([union, edge], dim=1)  # [B, 2, Hp, Wp]
+        return guidance.detach()
 
     def _generate_mask_guidance(self, masks, batch_idx, target_shape):
         """Generate [B, 2, H, W] mask guidance from instance masks.
@@ -2059,12 +2229,18 @@ class DepthSegment26(Segment26):
 
     def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
         # Task decoupling attention: decouple seg/depth features on all scales
+        # getattr default=True for backward compatibility with old checkpoints
+        decouple_p4p5 = getattr(self, "decouple_p4p5", True)
         seg_feat_p3, depth_feat_p3 = self.task_attention(x[0])
         seg_feat_p4, depth_feat_p4 = (
-            self.task_attention_p4(x[1]) if self.task_attention_p4 is not None else (x[1], x[1])
+            self.task_attention_p4(x[1])
+            if (decouple_p4p5 and self.task_attention_p4 is not None)
+            else (x[1], x[1])
         )
         seg_feat_p5, depth_feat_p5 = (
-            self.task_attention_p5(x[2]) if self.task_attention_p5 is not None else (x[2], x[2])
+            self.task_attention_p5(x[2])
+            if (decouple_p4p5 and self.task_attention_p5 is not None)
+            else (x[2], x[2])
         )
 
         # Build task-specific feature pyramids
@@ -2074,25 +2250,12 @@ class DepthSegment26(Segment26):
         # Segmentation forward uses decoupled seg features
         outputs = Segment26.forward(self, x_seg)
 
-        # Generate mask guidance for depth decoder
-        mask_guidance = None
-        if self.training and self._cached_batch is not None:
-            masks = self._cached_batch.get("masks")
-            batch_idx = self._cached_batch.get("batch_idx")
-            if masks is not None and batch_idx is not None:
-                # Drop mask guidance 30% of the time during training so that
-                # default_mask_feat gets trained and the decoder learns to
-                # estimate depth from image content, not just mask shapes.
-                if torch.rand(1, device=masks.device).item() > 0.30:
-                    mask_guidance = self._generate_mask_guidance(
-                        masks, batch_idx, x[0].shape
-                    )
-            self._cached_batch = None  # consume
-
-        # Mask-guided depth prediction (eval mode: no mask guidance by default)
-        if not self.training:
-            mask_guidance = None
-        depth = self.mask_guided_depth_decoder(x_depth, mask_guidance)
+        # Use segmentation-head proto guidance, not GT masks, so train/eval
+        # consume the same information source. Guidance is detached inside the
+        # decoder to protect the frozen segmentation path.
+        seg_guidance = self._extract_seg_guidance(outputs)
+        self._cached_batch = None  # GT mask guidance is intentionally unused
+        depth = self.mask_guided_depth_decoder(x_depth, seg_guidance)
         depth = torch.sigmoid(depth) * self.depth_scale  # normalize to [0, depth_scale] meters
 
         if self.training:
@@ -2103,6 +2266,11 @@ class DepthSegment26(Segment26):
         # Eval mode: store depth for external retrieval, return standard format
         # (SegmentationPredictor expects exact Segment26 output format)
         self._last_depth = depth
+
+        # Inject depth into preds_dict so that validation loss / metrics can access it
+        if isinstance(outputs, tuple) and len(outputs) == 2 and isinstance(outputs[1], dict):
+            outputs[1]["depth"] = depth
+
         return outputs
 
     def fuse(self) -> None:

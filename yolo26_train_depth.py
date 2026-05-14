@@ -143,6 +143,8 @@ def train_progressive():
     parser.add_argument("--project", type=str, default="runs/train_depth")
     parser.add_argument("--name", type=str, default="yolo26-seg-depth-exp")
     parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint")
+    parser.add_argument("--fliplr", type=float, default=None,
+                        help="Horizontal flip probability for depth augmentation (default: use hyp default 0.5)")
     args = parser.parse_args()
 
     # Handle --no-freeze-seg
@@ -162,6 +164,8 @@ def train_progressive():
         "name": args.name,
         "resume": args.resume,
     }
+    if args.fliplr is not None:
+        valid_overrides["fliplr"] = args.fliplr
 
     trainer = DepthSegmentTrainer(overrides=valid_overrides)
 

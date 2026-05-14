@@ -1906,9 +1906,12 @@ class MaskGuidedDepthDecoder(nn.Module):
         )
         self.gamma_head = nn.Conv2d(c_depth, c_depth, kernel_size=1, bias=True)
         self.beta_head = nn.Conv2d(c_depth, c_depth, kernel_size=1, bias=True)
-        nn.init.zeros_(self.gamma_head.weight)
+        # Small nonzero init for gamma so FiLM modulation is active from the
+        # start. Pure-zero init makes the guidance branch invisible for many
+        # epochs, delaying effective learning of boundary information.
+        nn.init.xavier_uniform_(self.gamma_head.weight, gain=0.01)
         nn.init.zeros_(self.gamma_head.bias)
-        nn.init.zeros_(self.beta_head.weight)
+        nn.init.xavier_uniform_(self.beta_head.weight, gain=0.01)
         nn.init.zeros_(self.beta_head.bias)
 
         # Retain the old encoder names for checkpoint loading compatibility.

@@ -1,21 +1,26 @@
-# Models (too large)
+# Archive directory - old documents, test scripts, media samples, diagnostic outputs
+archive/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Training runs (large files)
+runs/
+
+# Model weights (large binaries)
 # *.pt
-# *.pth
+*.pth
 *.onnx
 *.engine
-*.mp4
 
-*.mat
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-
-# Virtual environments
-venv/
-env/
-.venv/
+# Dataset (should not be committed)
+nyu_yolo/images/
+nyu_yolo/depths/
+nyu_yolo/labels/
+nyu_yolo/segments/
 
 # IDE
 .vscode/
@@ -27,9 +32,14 @@ env/
 .DS_Store
 Thumbs.db
 
+# Jupyter
+.ipynb_checkpoints/
+
 # Logs
 *.log
+nohup.out
 
-# Cache
-*.cache
-__cache__/
+# Temporary
+tmp/
+temp/
+/tmp/

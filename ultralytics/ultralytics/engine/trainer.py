@@ -516,7 +516,9 @@ class BaseTrainer:
 
             # Validation
             final_epoch = epoch + 1 >= self.epochs
-            if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
+            val_period = getattr(self.args, "val_period", 1)
+            should_val = self.args.val and (final_epoch or (epoch + 1) % max(val_period, 1) == 0 or self.stopper.possible_stop or self.stop)
+            if should_val:
                 self._clear_memory(None if self.device.type == "mps" else 0.5)  # prevent VRAM spike
                 self.metrics, self.fitness = self.validate()
 
@@ -958,6 +960,13 @@ class BaseTrainer:
             )
             self.epochs += ckpt["epoch"]  # finetune additional epochs
         self._load_checkpoint_state(ckpt)
+        # Optional LR scaling when resuming (e.g. lr_scale=0.3 for fine-tuning from best.pt)
+        lr_scale = getattr(self.args, "lr_scale", 1.0)
+        if lr_scale != 1.0 and self.optimizer is not None:
+            LOGGER.info(f"Scaling learning rate by {lr_scale} for resumed training")
+            for pg in self.optimizer.param_groups:
+                pg["lr"] *= lr_scale
+                pg["initial_lr"] = pg.get("initial_lr", pg["lr"]) * lr_scale
         if getattr(unwrap_model(self.model), "end2end", False):
             # initialize loss and resume o2o and o2m args
             unwrap_model(self.model).criterion = unwrap_model(self.model).init_criterion()

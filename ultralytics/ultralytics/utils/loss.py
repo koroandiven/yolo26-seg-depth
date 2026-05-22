@@ -1571,6 +1571,45 @@ class EdgeAwareSmoothnessLoss(nn.Module):
         return self.weight * loss
 
 
+class GradientMatchingLoss(nn.Module):
+    """Explicit gradient matching loss for depth estimation.
+
+    Directly minimizes the L1 difference between predicted depth gradients
+    and ground-truth depth gradients. This is a stronger structural constraint
+    than edge-alignment "encouragement" losses.
+    """
+
+    def __init__(self, weight: float = 0.3):
+        super().__init__()
+        self.weight = weight
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Args:
+            pred: [B, 1, H, W] predicted depth.
+            target: [B, 1, H, W] target depth.
+            valid_mask: [B, 1, H, W] bool mask of valid pixels.
+        """
+        pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+        pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+        target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
+        target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+
+        diff_x = torch.abs(pred_dx - target_dx)
+        diff_y = torch.abs(pred_dy - target_dy)
+
+        if valid_mask is not None:
+            # Crop valid_mask to match gradient shapes
+            vm_x = valid_mask[:, :, :, 1:]
+            vm_y = valid_mask[:, :, 1:, :]
+            diff_x = diff_x[vm_x]
+            diff_y = diff_y[vm_y]
+
+        if diff_x.numel() == 0 or diff_y.numel() == 0:
+            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+
+        return self.weight * (diff_x.mean() + diff_y.mean())
+
+
 class ImageEdgeAlignmentLoss(nn.Module):
     """Encourage depth gradients to align with image edges.
 
@@ -1636,6 +1675,10 @@ class MultiScaleDepthLoss(nn.Module):
         consistency_weight=0.05,
         smooth_weight=0.1,
         image_edge_weight=0.2,
+        gradient_weight=0.5,
+        silog_weight=1.3,
+        target_noise_sigma=0.05,
+        use_log_depth=False,
     ):
         super().__init__()
         self.scales = scales
@@ -1645,10 +1688,15 @@ class MultiScaleDepthLoss(nn.Module):
         self.consistency_fn = MaskConsistencyDepthLoss(weight=consistency_weight)
         self.smooth_loss_fn = EdgeAwareSmoothnessLoss(weight=smooth_weight)
         self.image_edge_fn = ImageEdgeAlignmentLoss(weight=image_edge_weight)
+        self.gradient_fn = GradientMatchingLoss(weight=gradient_weight)
         self.edge_weight = edge_weight
         self.consistency_weight = consistency_weight
         self.smooth_weight = smooth_weight
         self.image_edge_weight = image_edge_weight
+        self.gradient_weight = gradient_weight
+        self.silog_weight = silog_weight
+        self.target_noise_sigma = target_noise_sigma
+        self.use_log_depth = use_log_depth
 
     def forward(self, pred, target, masks=None, batch_idx=None, valid_mask=None, img=None):
         total_loss = 0
@@ -1663,6 +1711,13 @@ class MultiScaleDepthLoss(nn.Module):
             target = F.interpolate(target, size=pred.shape[-2:], mode="bilinear", align_corners=False)
             if valid_mask is not None:
                 valid_mask = F.interpolate(valid_mask.float(), size=pred.shape[-2:], mode="nearest") > 0.5
+
+        # Label smoothing: add tiny Gaussian noise to depth target to prevent
+        # overfitting exact pixel values.
+        if self.training and self.target_noise_sigma > 0:
+            noise = torch.randn_like(target) * self.target_noise_sigma
+            target = (target + noise).clamp_min(0)
+
         for scale in self.scales:
             if scale != 1.0:
                 pred_s = F.interpolate(pred, scale_factor=scale, mode="bilinear", align_corners=False)
@@ -1674,8 +1729,19 @@ class MultiScaleDepthLoss(nn.Module):
             else:
                 pred_s, target_s = pred, target
                 valid_mask_s = valid_mask
-            total_loss += self.silog(pred_s, target_s, valid_mask=valid_mask_s) + 0.5 * self.berhu(pred_s, target_s, valid_mask=valid_mask_s)
+            total_loss += self.silog_weight * self.silog(pred_s, target_s, valid_mask=valid_mask_s)
+            if self.use_log_depth:
+                # BerHu in log-space for scale-invariant depth prediction
+                pred_log = torch.log(pred_s.clamp_min(1e-3))
+                target_log = torch.log(target_s.clamp_min(1e-3))
+                total_loss += 0.5 * self.berhu(pred_log, target_log, valid_mask=valid_mask_s)
+            else:
+                total_loss += 0.5 * self.berhu(pred_s, target_s, valid_mask=valid_mask_s)
         total_loss = total_loss / len(self.scales)
+
+        # Gradient matching loss: direct structural constraint on depth edges
+        if self.gradient_weight > 0:
+            total_loss += self.gradient_fn(pred, target, valid_mask=valid_mask)
 
         # Edge-aware smoothness loss: prevent constant-depth predictions
         if self.smooth_weight > 0:
@@ -1748,7 +1814,7 @@ class GradNormLoss(nn.Module):
 class DepthSegmentationLoss(v8SegmentationLoss):
     """Segmentation + Depth joint loss (with dynamic weights + multi-scale loss)."""
 
-    def __init__(self, model, depth_weight=0.5, use_gradnorm=False, freeze_seg=False, tal_topk=10, tal_topk2=None):
+    def __init__(self, model, depth_weight=0.5, use_gradnorm=False, freeze_seg=False, tal_topk=10, tal_topk2=None, use_log_depth=False):
         super().__init__(model, tal_topk, tal_topk2)
         self.use_gradnorm = use_gradnorm
         self.depth_weight = depth_weight
@@ -1759,6 +1825,9 @@ class DepthSegmentationLoss(v8SegmentationLoss):
             consistency_weight=0.05,
             smooth_weight=0.1,
             image_edge_weight=0.2,
+            gradient_weight=0.5,
+            silog_weight=1.3,
+            use_log_depth=use_log_depth,
         )
         self._loss_names = ["box", "seg", "cls", "dfl", "semseg", "depth"]
         self.updates = 0  # for resume compatibility with end2end training
@@ -1799,6 +1868,11 @@ class DepthSegmentationLoss(v8SegmentationLoss):
             with torch.no_grad():
                 seg_loss, loss_items = super().loss(seg_preds, batch)
             seg_loss_val = seg_loss.sum().detach()
+            # Zero out seg loss items to prevent frozen seg losses from polluting logs
+            if loss_items.numel() >= 5:
+                loss_items[:5] = 0.0
+            elif loss_items.numel() >= 4:
+                loss_items[:4] = 0.0
         else:
             seg_loss, loss_items = super().loss(seg_preds, batch)
             seg_loss_val = seg_loss.sum()

@@ -1854,14 +1854,66 @@ class SpatialBiasCorrection(nn.Module):
 class DepthResidualBlock(nn.Module):
     """Residual block for depth feature refinement (no BatchNorm)."""
 
-    def __init__(self, channels):
+    def __init__(self, channels, dropout=0.0):
         super().__init__()
         self.conv1 = DepthConv(channels, channels, k=3)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=True)
         self.act = nn.SiLU()
+        self.drop = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x):
-        return self.act(x + self.conv2(self.conv1(x)))
+        out = self.conv2(self.conv1(x))
+        out = self.drop(out)
+        return self.act(x + out)
+
+
+class DilatedDepthBlock(nn.Module):
+    """Dilated convolution block for expanding receptive field in depth estimation.
+
+    Uses two parallel dilated convolutions (d=2, d=4) and fuses them with a
+    1x1 conv.  The residual connection helps training stability.
+    """
+
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = DepthConv(channels, channels, k=3, d=2)
+        self.conv2 = DepthConv(channels, channels, k=3, d=4)
+        self.fuse = nn.Conv2d(channels * 2, channels, 1, bias=True)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.act(x + self.fuse(torch.cat([self.conv1(x), self.conv2(x)], dim=1)))
+
+
+class RGBGuidedRefine(nn.Module):
+    """Lightweight RGB-guided depth refinement at full resolution.
+
+    After coarse depth is upsampled to 640x640, this module fuses the
+    original RGB image to recover sharp edges lost during 8x upsampling.
+    """
+
+    def __init__(self, rgb_ch=3, hidden=16, dropout=0.1):
+        super().__init__()
+        self.rgb_enc = nn.Sequential(
+            DepthConv(rgb_ch, hidden, 3),
+            nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity(),
+            DepthConv(hidden, hidden, 3),
+            nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity(),
+        )
+        self.fuse = nn.Sequential(
+            DepthConv(1 + hidden, hidden * 2, 3),
+            nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity(),
+            DepthConv(hidden * 2, hidden, 3),
+            nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity(),
+            nn.Conv2d(hidden, 1, 1, bias=True),
+        )
+
+    def forward(self, coarse_depth, rgb):
+        """coarse_depth: [B,1,H,W], rgb: [B,3,H,W] in [0,255] or [0,1]."""
+        if rgb.max() > 1.5:
+            rgb = rgb / 255.0
+        rgb_feat = self.rgb_enc(rgb)
+        return self.fuse(torch.cat([coarse_depth, rgb_feat], dim=1))
 
 
 class MaskGuidedDepthDecoder(nn.Module):
@@ -1872,14 +1924,24 @@ class MaskGuidedDepthDecoder(nn.Module):
     a ``(gamma, beta)`` pair that modulates the depth feature multiplicatively
     so the decoder cannot trivially ignore the segmentation signal.
 
-    For backward compatibility the decoder also accepts a single-channel proto
-    tensor (treated as a generic feature map) when the channel count matches
-    ``seg_guidance_ch``.
+    Improvements over baseline:
+      - Multi-stage FiLM: each refine block gets its own (gamma, beta).
+      - DilatedDepthBlock in refine stack for larger receptive field.
+      - Dropout2d in residual blocks for regularization.
+      - Optional RGBGuidedRefine at full resolution.
     """
 
-    def __init__(self, ch, c_depth=128, seg_guidance_ch=32):
+    def __init__(self, ch, c_depth=128, seg_guidance_ch=32, dropout=0.1, use_multi_film=True, use_rgb_refine=True, use_p2_skip=False):
         super().__init__()
-        c3, c4, c5 = ch[0], ch[1], ch[2]  # P3/8, P4/16, P5/32
+        self.use_p2_skip = use_p2_skip
+        self.use_multi_film = use_multi_film
+        self.use_rgb_refine = use_rgb_refine
+
+        if use_p2_skip and len(ch) >= 4:
+            c2, c3, c4, c5 = ch[0], ch[1], ch[2], ch[3]  # P2/4, P3/8, P4/16, P5/32
+        else:
+            c2 = None
+            c3, c4, c5 = ch[0], ch[1], ch[2]  # P3/8, P4/16, P5/32
 
         # Multi-scale depth feature extraction
         self.depth_p5 = nn.Sequential(
@@ -1892,12 +1954,39 @@ class MaskGuidedDepthDecoder(nn.Module):
         )
         self.depth_p3 = nn.Conv2d(c3, c_depth, 1)
 
+        # P2 skip connection (optional high-resolution path)
+        if use_p2_skip and c2 is not None:
+            self.skip_p2 = nn.Conv2d(c2, c_depth // 4, 1)
+            self.up_2x_1 = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                DepthConv(c_depth, c_depth // 4, k=3),
+            )
+            self.refine_160 = DepthResidualBlock(c_depth // 4 * 2, dropout)
+            self.up_2x_2 = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                DepthConv(c_depth // 4 * 2, c_depth // 8, k=3),
+            )
+            self.rgb_encoder_for_skip = nn.Sequential(
+                DepthConv(3, 16, k=3),
+                DepthConv(16, c_depth // 8, k=3),
+            )
+            self.refine_320 = DepthResidualBlock(c_depth // 8 * 2, dropout)
+            self.up_2x_3 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+            self.depth_head = nn.Conv2d(c_depth // 8 * 2, 1, 1, bias=True)
+            # When P2 skip is active, we don't use the old 8x up + refine path
+            self.depth_up = None
+            self.depth_refine = None
+            self.fusion_out = None
+        else:
+            self.skip_p2 = None
+            self.up_2x_1 = None
+            self.refine_160 = None
+            self.up_2x_2 = None
+            self.rgb_encoder_for_skip = None
+            self.refine_320 = None
+            self.up_2x_3 = None
+
         # ---- Soft mask guidance branch ----------------------------------
-        # Input: 2 channels = [soft_union_mask, soft_edge_magnitude]
-        # Output: 2 * c_depth channels split into (gamma, beta) for FiLM.
-        # gamma_head is zero-initialised so FiLM starts as identity, which
-        # keeps early training stable even before the segmentation head
-        # produces meaningful masks.
         self.guidance_in_ch = 2
         self.guidance_encoder = nn.Sequential(
             DepthConv(self.guidance_in_ch, c_depth // 4, 3),
@@ -1906,17 +1995,12 @@ class MaskGuidedDepthDecoder(nn.Module):
         )
         self.gamma_head = nn.Conv2d(c_depth, c_depth, kernel_size=1, bias=True)
         self.beta_head = nn.Conv2d(c_depth, c_depth, kernel_size=1, bias=True)
-        # Small nonzero init for gamma so FiLM modulation is active from the
-        # start. Pure-zero init makes the guidance branch invisible for many
-        # epochs, delaying effective learning of boundary information.
         nn.init.xavier_uniform_(self.gamma_head.weight, gain=0.01)
         nn.init.zeros_(self.gamma_head.bias)
         nn.init.xavier_uniform_(self.beta_head.weight, gain=0.01)
         nn.init.zeros_(self.beta_head.bias)
 
-        # Retain the old encoder names for checkpoint loading compatibility.
-        # They are unused at runtime but allow exp7/exp8/exp12 checkpoints
-        # to load without strict-mode failures when ``load(strict=False)``.
+        # Retain old encoder names for checkpoint compatibility.
         self.mask_encoder = nn.Sequential(
             DepthConv(2, c_depth // 4, 3),
             DepthConv(c_depth // 4, c_depth // 2, 3),
@@ -1927,46 +2011,73 @@ class MaskGuidedDepthDecoder(nn.Module):
             DepthConv(c_depth // 4, c_depth // 2, 3),
         )
 
-        # Fusion: P5 + P4 + P3 only; guidance is injected via FiLM after fusion.
-        self.fusion_in = DepthConv(c_depth * 3, c_depth, k=3)
+        if not use_p2_skip:
+            # Fusion: P5 + P4 + P3
+            self.fusion_in = DepthConv(c_depth * 3, c_depth, k=3)
 
-        # Deep refinement with residual blocks
-        self.refine_blocks = nn.Sequential(
-            DepthResidualBlock(c_depth),
-            DepthResidualBlock(c_depth),
-            DepthResidualBlock(c_depth),
-            DepthResidualBlock(c_depth),
-        )
+            # Refine stack: 3 ResBlocks + 1 Dilated block + 1 ResBlock
+            self.refine_blocks = nn.ModuleList([
+                DepthResidualBlock(c_depth, dropout),
+                DepthResidualBlock(c_depth, dropout),
+                DilatedDepthBlock(c_depth),
+                DepthResidualBlock(c_depth, dropout),
+            ])
 
-        self.fusion_out = nn.Sequential(
-            DepthConv(c_depth, c_depth // 2, k=3),
-            DepthConv(c_depth // 2, c_depth // 4, k=3),
-        )
-        self.depth_head = nn.Conv2d(c_depth // 4, 1, kernel_size=1, bias=True)
-        self.depth_up = nn.Upsample(scale_factor=8, mode="bilinear", align_corners=False)
-        # Post-upsample refinement
-        self.depth_refine = nn.Sequential(
-            DepthConv(1, 16, k=3),
-            nn.Conv2d(16, 1, kernel_size=1, bias=True),
-        )
+            self.fusion_out = nn.Sequential(
+                DepthConv(c_depth, c_depth // 2, k=3),
+                DepthConv(c_depth // 2, c_depth // 4, k=3),
+            )
+            self.depth_head = nn.Conv2d(c_depth // 4, 1, kernel_size=1, bias=True)
+            self.depth_up = nn.Upsample(scale_factor=8, mode="bilinear", align_corners=False)
+            self.depth_refine = nn.Sequential(
+                DepthConv(1, 16, k=3),
+                nn.Conv2d(16, 1, kernel_size=1, bias=True),
+            )
+        else:
+            self.fusion_in = DepthConv(c_depth * 3, c_depth, k=3)
+            self.refine_blocks = nn.ModuleList([
+                DepthResidualBlock(c_depth, dropout),
+                DepthResidualBlock(c_depth, dropout),
+                DilatedDepthBlock(c_depth),
+                DepthResidualBlock(c_depth, dropout),
+            ])
 
-        # SpatialBiasCorrection has been removed (was unregularised and was
-        # actively memorising the NYU left/right asymmetry). Older checkpoints
-        # may still contain its parameters; they will be reported as
-        # "unexpected" keys by ``load(strict=False)`` and ignored.
+        # Multi-stage FiLM heads (one per refine block)
+        if use_multi_film:
+            n_film_blocks = len(self.refine_blocks)
+            self.film_heads = nn.ModuleList([
+                nn.ModuleDict({
+                    "gamma": nn.Conv2d(c_depth, c_depth, 1, bias=True),
+                    "beta": nn.Conv2d(c_depth, c_depth, 1, bias=True),
+                })
+                for _ in range(n_film_blocks)
+            ])
+            for fh in self.film_heads:
+                nn.init.xavier_uniform_(fh["gamma"].weight, gain=0.01)
+                nn.init.zeros_(fh["gamma"].bias)
+                nn.init.xavier_uniform_(fh["beta"].weight, gain=0.01)
+                nn.init.zeros_(fh["beta"].bias)
+        else:
+            self.film_heads = None
+
+        # Optional RGB-guided refinement at full resolution
+        if use_rgb_refine and not use_p2_skip:
+            self.rgb_refine = RGBGuidedRefine(dropout=dropout)
+        else:
+            self.rgb_refine = None
 
         # Learnable default FiLM offsets used when no guidance is supplied.
         self.default_film_gamma = nn.Parameter(torch.zeros(1, c_depth, 1, 1))
         self.default_film_beta = nn.Parameter(torch.zeros(1, c_depth, 1, 1))
-        # Retained for checkpoint compatibility (unused at runtime).
         self.default_mask_feat = nn.Parameter(torch.zeros(1, c_depth // 2, 1, 1))
 
-    def _compute_film(self, mask_guidance, ref_shape):
+    def _compute_film(self, mask_guidance, ref_shape, stage=0):
         """Compute ``(gamma, beta)`` FiLM tensors at depth feature resolution.
 
         Args:
             mask_guidance: Optional ``[B, 2, H, W]`` soft mask + edge tensor.
             ref_shape: Tuple ``(B, C, H, W)`` of the depth feature to modulate.
+            stage: Index of the refine block (for multi-stage FiLM).
         """
         B, C, H, W = ref_shape
         if mask_guidance is None:
@@ -1975,7 +2086,6 @@ class MaskGuidedDepthDecoder(nn.Module):
             return gamma, beta
 
         if mask_guidance.shape[1] != self.guidance_in_ch:
-            # Unexpected channel count: fall back to default.
             gamma = self.default_film_gamma.expand(B, -1, H, W)
             beta = self.default_film_beta.expand(B, -1, H, W)
             return gamma, beta
@@ -1984,15 +2094,22 @@ class MaskGuidedDepthDecoder(nn.Module):
             mask_guidance = F.interpolate(
                 mask_guidance, size=(H, W), mode="bilinear", align_corners=False
             )
-        # Detach again to be safe (call site already detaches, but FiLM must
-        # never leak depth gradients into the segmentation head).
         feat = self.guidance_encoder(mask_guidance.detach())
-        gamma = self.gamma_head(feat)
-        beta = self.beta_head(feat)
+
+        if self.use_multi_film and self.film_heads is not None and stage < len(self.film_heads):
+            gamma = self.film_heads[stage]["gamma"](feat)
+            beta = self.film_heads[stage]["beta"](feat)
+        else:
+            gamma = self.gamma_head(feat)
+            beta = self.beta_head(feat)
         return gamma, beta
 
-    def forward(self, features, mask_guidance=None):
-        p3, p4, p5 = features[0], features[1], features[2]
+    def forward(self, features, mask_guidance=None, rgb=None):
+        if self.use_p2_skip and len(features) >= 4:
+            p2, p3, p4, p5 = features[0], features[1], features[2], features[3]
+        else:
+            p2 = None
+            p3, p4, p5 = features[0], features[1], features[2]
 
         d_p5 = self.depth_p5(p5)
         d_p4 = self.depth_p4(p4)
@@ -2003,42 +2120,104 @@ class MaskGuidedDepthDecoder(nn.Module):
         if mask_guidance is not None:
             mask_guidance = mask_guidance.detach()
 
-        # Concatenate all multi-scale features (no guidance concat here).
         fused = torch.cat([d_p5, d_p4, d_p3], dim=1)
         depth_feat = self.fusion_in(fused)
 
-        # FiLM-modulate the depth feature with guidance-derived (gamma, beta).
-        gamma, beta = self._compute_film(mask_guidance, depth_feat.shape)
-        depth_feat = depth_feat * (1.0 + gamma) + beta
+        # Multi-stage FiLM + refine blocks
+        for i, block in enumerate(self.refine_blocks):
+            gamma, beta = self._compute_film(mask_guidance, depth_feat.shape, stage=i)
+            depth_feat = depth_feat * (1.0 + gamma) + beta
+            depth_feat = block(depth_feat)
 
-        depth_feat = self.refine_blocks(depth_feat)
-        depth_feat = self.fusion_out(depth_feat)
-        depth = self.depth_head(depth_feat)
-        depth = self.depth_up(depth)
-        depth = self.depth_refine(depth)
+        if self.use_p2_skip and p2 is not None:
+            # Multi-stage upsample: 80 -> 160 -> 320 -> 640
+            depth_feat = self.up_2x_1(depth_feat)  # 80 -> 160
+            p2_proj = self.skip_p2(p2)
+            if p2_proj.shape[-2:] != depth_feat.shape[-2:]:
+                p2_proj = F.interpolate(p2_proj, size=depth_feat.shape[-2:], mode="bilinear", align_corners=False)
+            depth_feat = self.refine_160(torch.cat([depth_feat, p2_proj], dim=1))
+
+            depth_feat = self.up_2x_2(depth_feat)  # 160 -> 320
+            if rgb is not None:
+                rgb_feat = self.rgb_encoder_for_skip(rgb / 255.0 if rgb.max() > 1.5 else rgb)
+                if rgb_feat.shape[-2:] != depth_feat.shape[-2:]:
+                    rgb_feat = F.interpolate(rgb_feat, size=depth_feat.shape[-2:], mode="bilinear", align_corners=False)
+                depth_feat = self.refine_320(torch.cat([depth_feat, rgb_feat], dim=1))
+            else:
+                # If no RGB, pad with zeros to match expected channels
+                c_rgb = self.rgb_encoder_for_skip[-1].conv.out_channels if hasattr(self.rgb_encoder_for_skip[-1], 'conv') else depth_feat.shape[1] // 2
+                zeros = torch.zeros(depth_feat.shape[0], c_rgb, depth_feat.shape[2], depth_feat.shape[3], device=depth_feat.device, dtype=depth_feat.dtype)
+                depth_feat = self.refine_320(torch.cat([depth_feat, zeros], dim=1))
+
+            depth_feat = self.up_2x_3(depth_feat)  # 320 -> 640
+            depth = self.depth_head(depth_feat)
+        else:
+            depth_feat = self.fusion_out(depth_feat)
+            depth = self.depth_head(depth_feat)
+            depth = self.depth_up(depth)
+            depth = self.depth_refine(depth)
+
+            if self.use_rgb_refine and self.rgb_refine is not None and rgb is not None:
+                depth = depth + self.rgb_refine(depth, rgb)
+
         return depth
 
 
 class DepthSegment26(Segment26):
     """YOLO26 Segment + Depth multi-task head (with decoupling attention + mask-guided depth)."""
 
-    def __init__(self, nc=80, nm=32, npr=256, reg_max=16, end2end=False, ch=(), depth_scale=100.0, decouple_p4p5=True):
-        super().__init__(nc, nm, npr, reg_max, end2end, ch)
-
+    def __init__(
+        self,
+        nc=80,
+        nm=32,
+        npr=256,
+        reg_max=16,
+        end2end=False,
+        ch=(),
+        depth_scale=100.0,
+        decouple_p4p5=True,
+        decoder_dropout=0.1,
+        use_multi_film=True,
+        use_rgb_refine=True,
+        use_p2_skip=False,
+        use_log_depth=False,
+    ):
         self.depth_scale = depth_scale
         self.decouple_p4p5 = decouple_p4p5
+        self.use_p2_skip = use_p2_skip
+        self.use_log_depth = use_log_depth
+
+        # Segmentation head only needs P3/P4/P5 (3 detection layers).
+        # When P2 skip is active, ch has 4 elements [P2, P3, P4, P5].
+        # We pass only P3/P4/P5 to the parent Segment26.
+        if use_p2_skip and len(ch) >= 4:
+            seg_ch = ch[1:4]
+            depth_ch = ch
+            seg_ch_idx = 1  # P3 index in full ch list
+        else:
+            seg_ch = ch
+            depth_ch = ch
+            seg_ch_idx = 0
+
+        super().__init__(nc, nm, npr, reg_max, end2end, seg_ch)
 
         # Task decoupling attention for P3 (main depth feature)
-        self.task_attention = TaskDecouplingAttention(ch[0])
+        self.task_attention = TaskDecouplingAttention(seg_ch[0])
 
         # Light task decoupling for P4/P5 to reduce segmentation bias in depth path
         # Always create modules for checkpoint compatibility, but forward can skip them
-        self.task_attention_p4 = TaskDecouplingAttention(ch[1]) if len(ch) > 1 else None
-        self.task_attention_p5 = TaskDecouplingAttention(ch[2]) if len(ch) > 2 else None
+        self.task_attention_p4 = TaskDecouplingAttention(seg_ch[1]) if len(seg_ch) > 1 else None
+        self.task_attention_p5 = TaskDecouplingAttention(seg_ch[2]) if len(seg_ch) > 2 else None
 
         # Mask-guided depth decoder
-        c_depth = max(ch[0] // 2, 128)
-        self.mask_guided_depth_decoder = MaskGuidedDepthDecoder(ch, c_depth, seg_guidance_ch=nm)
+        c_depth = max(seg_ch[0] // 2, 128)
+        self.mask_guided_depth_decoder = MaskGuidedDepthDecoder(
+            depth_ch, c_depth, seg_guidance_ch=nm,
+            dropout=decoder_dropout,
+            use_multi_film=use_multi_film,
+            use_rgb_refine=use_rgb_refine,
+            use_p2_skip=use_p2_skip,
+        )
 
         # Batch cache for training mask guidance (set by BaseModel.loss)
         self._cached_batch = None
@@ -2131,8 +2310,9 @@ class DepthSegment26(Segment26):
         soft_logits = torch.bmm(mc_top.transpose(1, 2), proto_flat)  # [B, k, Hp*Wp]
         soft_masks = torch.sigmoid(soft_logits).view(B, k, Hp, Wp)
 
-        # Suppress low-score anchors (multiplicative, keeps gradient-free).
-        score_gate = (topk_scores > score_thr).to(soft_masks.dtype).view(B, k, 1, 1)
+        # Soft score gate: weight masks by confidence instead of hard threshold.
+        # This avoids zero guidance during early training when scores are low.
+        score_gate = topk_scores.view(B, k, 1, 1)  # continuous [0, 1]
         soft_masks = soft_masks * score_gate
 
         # Soft union: 1 - prod(1 - m_i)
@@ -2230,25 +2410,40 @@ class DepthSegment26(Segment26):
 
         return torch.cat([occupancy, edge], dim=1)
 
-    def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
+    def forward(self, x: list[torch.Tensor], augment: bool = False, *args, **kwargs) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
         # Task decoupling attention: decouple seg/depth features on all scales
         # getattr default=True for backward compatibility with old checkpoints
         decouple_p4p5 = getattr(self, "decouple_p4p5", True)
-        seg_feat_p3, depth_feat_p3 = self.task_attention(x[0])
+        use_p2_skip = getattr(self, "use_p2_skip", False)
+
+        # When P2 skip is active, x[0] = P2, x[1] = P3, x[2] = P4, x[3] = P5
+        # Otherwise, x[0] = P3, x[1] = P4, x[2] = P5
+        if use_p2_skip and len(x) >= 4:
+            p2 = x[0]
+            x3, x4, x5 = x[1], x[2], x[3]
+        else:
+            p2 = None
+            x3, x4, x5 = x[0], x[1], x[2]
+
+        seg_feat_p3, depth_feat_p3 = self.task_attention(x3)
         seg_feat_p4, depth_feat_p4 = (
-            self.task_attention_p4(x[1])
+            self.task_attention_p4(x4)
             if (decouple_p4p5 and self.task_attention_p4 is not None)
-            else (x[1], x[1])
+            else (x4, x4)
         )
         seg_feat_p5, depth_feat_p5 = (
-            self.task_attention_p5(x[2])
+            self.task_attention_p5(x5)
             if (decouple_p4p5 and self.task_attention_p5 is not None)
-            else (x[2], x[2])
+            else (x5, x5)
         )
 
         # Build task-specific feature pyramids
         x_seg = [seg_feat_p3, seg_feat_p4, seg_feat_p5]
-        x_depth = [depth_feat_p3, depth_feat_p4, depth_feat_p5]
+        # Depth path includes P2 if available
+        if p2 is not None:
+            x_depth = [p2, depth_feat_p3, depth_feat_p4, depth_feat_p5]
+        else:
+            x_depth = [depth_feat_p3, depth_feat_p4, depth_feat_p5]
 
         # Segmentation forward uses decoupled seg features
         outputs = Segment26.forward(self, x_seg)
@@ -2257,9 +2452,33 @@ class DepthSegment26(Segment26):
         # consume the same information source. Guidance is detached inside the
         # decoder to protect the frozen segmentation path.
         seg_guidance = self._extract_seg_guidance(outputs)
+
+        # Retrieve RGB image from cached batch for RGB-guided refinement
+        rgb = None
+        if self._cached_batch is not None:
+            rgb = self._cached_batch.get("img")
+        cached_batch_for_tta = self._cached_batch
         self._cached_batch = None  # GT mask guidance is intentionally unused
-        depth = self.mask_guided_depth_decoder(x_depth, seg_guidance)
-        depth = torch.sigmoid(depth) * self.depth_scale  # normalize to [0, depth_scale] meters
+
+        depth = self.mask_guided_depth_decoder(x_depth, seg_guidance, rgb=rgb)
+        if self.use_log_depth:
+            depth = torch.exp(torch.clamp(depth, max=20))  # log-space depth prediction
+        else:
+            depth = torch.sigmoid(depth) * self.depth_scale  # normalize to [0, depth_scale] meters
+
+        # Test-Time Augmentation (TTA): average with flipped prediction
+        if augment and not self.training:
+            # Flip features horizontally
+            x_depth_flipped = [torch.flip(f, dims=[-1]) for f in x_depth]
+            seg_guidance_flipped = torch.flip(seg_guidance, dims=[-1]) if seg_guidance is not None else None
+            rgb_flipped = torch.flip(rgb, dims=[-1]) if rgb is not None else None
+            depth_flipped = self.mask_guided_depth_decoder(x_depth_flipped, seg_guidance_flipped, rgb=rgb_flipped)
+            if self.use_log_depth:
+                depth_flipped = torch.exp(torch.clamp(depth_flipped, max=20))
+            else:
+                depth_flipped = torch.sigmoid(depth_flipped) * self.depth_scale
+            depth_flipped = torch.flip(depth_flipped, dims=[-1])
+            depth = (depth + depth_flipped) * 0.5
 
         if self.training:
             if isinstance(outputs, dict):

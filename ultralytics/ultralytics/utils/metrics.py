@@ -1556,12 +1556,17 @@ class OBBMetrics(DetMetrics):
 
 
 class DepthMetric:
-    """Depth estimation evaluation metrics (AbsRel/RMSE/SILog)."""
+    """Depth estimation evaluation metrics (AbsRel/RMSE/SILog/delta/rmse_log/sq_rel)."""
 
     def __init__(self):
         self.abs_rel = []
         self.rmse = []
         self.silog = []
+        self.rmse_log = []
+        self.sq_rel = []
+        self.delta1 = []
+        self.delta2 = []
+        self.delta3 = []
 
     def update(self, pred, target):
         """Update metrics."""
@@ -1572,10 +1577,22 @@ class DepthMetric:
         rmse = torch.sqrt(torch.mean(diff.pow(2))).item()
         log_diff = torch.log(pred) - torch.log(target)
         silog = torch.sqrt(torch.mean(log_diff.pow(2)) - torch.mean(log_diff).pow(2)).item()
+        rmse_log = torch.sqrt(torch.mean(log_diff.pow(2))).item()
+        sq_rel = torch.mean(diff.pow(2) / (target + 1e-8)).item()
+
+        ratio = torch.max(pred / target, target / pred)
+        delta1 = (ratio < 1.25).float().mean().item()
+        delta2 = (ratio < 1.25 ** 2).float().mean().item()
+        delta3 = (ratio < 1.25 ** 3).float().mean().item()
 
         self.abs_rel.append(abs_rel)
         self.rmse.append(rmse)
         self.silog.append(silog)
+        self.rmse_log.append(rmse_log)
+        self.sq_rel.append(sq_rel)
+        self.delta1.append(delta1)
+        self.delta2.append(delta2)
+        self.delta3.append(delta3)
 
     def compute(self):
         """Compute final metrics."""
@@ -1583,4 +1600,9 @@ class DepthMetric:
             "abs_rel": np.mean(self.abs_rel) if self.abs_rel else 0.0,
             "rmse": np.mean(self.rmse) if self.rmse else 0.0,
             "silog": np.mean(self.silog) if self.silog else 0.0,
+            "rmse_log": np.mean(self.rmse_log) if self.rmse_log else 0.0,
+            "sq_rel": np.mean(self.sq_rel) if self.sq_rel else 0.0,
+            "delta1": np.mean(self.delta1) if self.delta1 else 0.0,
+            "delta2": np.mean(self.delta2) if self.delta2 else 0.0,
+            "delta3": np.mean(self.delta3) if self.delta3 else 0.0,
         }

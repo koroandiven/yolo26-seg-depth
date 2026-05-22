@@ -69,6 +69,108 @@ class DepthRandomFlip:
         return labels
 
 
+class DepthSafeColorJitter:
+    """Color jitter that only affects RGB, safe for depth supervision.
+
+    Adjusts brightness and contrast in-place. Depth, masks, and bboxes
+    are left untouched.
+    """
+
+    def __init__(self, brightness: float = 0.3, contrast: float = 0.3):
+        self.brightness = brightness
+        self.contrast = contrast
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        img = labels["img"]
+        if img.dtype != np.uint8 or img.shape[-1] != 3:
+            return labels
+
+        # Brightness
+        if self.brightness > 0:
+            beta = random.uniform(-self.brightness, self.brightness)
+            img = np.clip(img.astype(np.float32) * (1.0 + beta), 0, 255).astype(np.uint8)
+
+        # Contrast
+        if self.contrast > 0:
+            alpha = random.uniform(1.0 - self.contrast, 1.0 + self.contrast)
+            img = np.clip(img.astype(np.float32) * alpha, 0, 255).astype(np.uint8)
+
+        labels["img"] = img
+        return labels
+
+
+class DepthSafeGaussianBlur:
+    """Random Gaussian blur, safe for depth (only blurs RGB)."""
+
+    def __init__(self, p: float = 0.3, kernel_range: tuple = (3, 7)):
+        self.p = p
+        self.kernel_range = kernel_range
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        if random.random() >= self.p:
+            return labels
+        img = labels["img"]
+        if img.dtype != np.uint8:
+            return labels
+        k = random.choice(range(self.kernel_range[0], self.kernel_range[1] + 1, 2))
+        if k < 3:
+            return labels
+        labels["img"] = cv2.GaussianBlur(img, (k, k), 0)
+        return labels
+
+
+class DepthSafeNoise:
+    """Add slight Gaussian noise to RGB, safe for depth supervision."""
+
+    def __init__(self, sigma: float = 5.0 / 255.0, p: float = 0.2):
+        self.sigma = sigma
+        self.p = p
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        if random.random() >= self.p:
+            return labels
+        img = labels["img"]
+        if img.dtype != np.uint8:
+            return labels
+        noise = np.random.normal(0, self.sigma * 255, img.shape).astype(np.float32)
+        img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        labels["img"] = img
+        return labels
+
+
+class DepthSafeCutOut:
+    """CutOut augmentation that also masks depth (set to 0).
+
+    This makes the cut region invalid for depth loss via the existing
+    valid_mask (depth > 0) mechanism.
+    """
+
+    def __init__(self, p: float = 0.2, max_holes: int = 3, max_size: float = 0.1):
+        self.p = p
+        self.max_holes = max_holes
+        self.max_size = max_size
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        if random.random() >= self.p:
+            return labels
+        img = labels["img"]
+        h, w = img.shape[:2]
+        depth = labels.get("depth")
+        n_holes = random.randint(1, self.max_holes)
+        for _ in range(n_holes):
+            cw = int(w * random.uniform(0.02, self.max_size))
+            ch = int(h * random.uniform(0.02, self.max_size))
+            x1 = random.randint(0, max(0, w - cw))
+            y1 = random.randint(0, max(0, h - ch))
+            img[y1 : y1 + ch, x1 : x1 + cw] = 114  # standard padding gray
+            if depth is not None:
+                depth[y1 : y1 + ch, x1 : x1 + cw] = 0.0
+        labels["img"] = img
+        if depth is not None:
+            labels["depth"] = depth
+        return labels
+
+
 
 class DepthSegmentDataset(BaseDataset):
     """Dataset class for Depth + Segmentation multi-task learning.
@@ -102,6 +204,8 @@ class DepthSegmentDataset(BaseDataset):
         task: str = "segment",
         depth_max: float = 100.0,
         depth_scale: float = 100.0,
+        depth_norm_max: float | None = None,
+        source_tag: str = "",
         **kwargs,
     ):
         """Initialize DepthSegmentDataset.
@@ -111,6 +215,11 @@ class DepthSegmentDataset(BaseDataset):
             task: Task type, "segment" for depth+segment
             depth_max: Maximum raw depth value in meters (for clipping loaded depth)
             depth_scale: Scale factor to normalize depth targets to [0, depth_scale]
+            depth_norm_max: Per-source max depth for normalizing to [0, depth_scale]
+                (e.g. NYU 10.0, KITTI 80.0). When set, depth is normalized as
+                depth = raw_depth / depth_norm_max * depth_scale, eliminating
+                absolute scale differences between sources.
+            source_tag: Identifier string for multi-source training (e.g. "nyu", "kitti")
             *args: Additional positional arguments for parent class
             **kwargs: Additional keyword arguments for parent class
         """
@@ -119,7 +228,9 @@ class DepthSegmentDataset(BaseDataset):
         self.use_obb = False
         self.depth_max = depth_max
         self.depth_scale = depth_scale
+        self.depth_norm_max = depth_norm_max
         self.data = data
+        self.source_tag = source_tag
         super().__init__(*args, channels=3, **kwargs)
 
     def get_img_files(self, img_path: str) -> list:
@@ -292,6 +403,11 @@ class DepthSegmentDataset(BaseDataset):
                 LetterBox(new_shape=(self.imgsz, self.imgsz)),
                 DepthRandomFlip(p=fliplr_p),
                 RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
+                # New safe augmentations for depth (only affect RGB, or sync mask depth)
+                DepthSafeColorJitter(brightness=0.4, contrast=0.4),
+                DepthSafeGaussianBlur(p=0.3, kernel_range=(3, 7)),
+                DepthSafeCutOut(p=0.2, max_holes=3, max_size=0.1),
+                DepthSafeNoise(sigma=5.0 / 255.0, p=0.2),
             ]
             transforms = Compose(transforms_list)
         else:
@@ -348,9 +464,13 @@ class DepthSegmentDataset(BaseDataset):
             return np.zeros((self.imgsz, self.imgsz), dtype=np.float32)
 
         # Convert from mm to meters, clip outliers
-        # Target stays in raw meters to match model output (sigmoid * depth_scale)
         depth = depth.astype(np.float32) / 1000.0
         depth = np.clip(depth, 0, self.depth_max)
+        # Per-source depth normalization: eliminate absolute scale differences
+        # between sources (e.g. NYU 0-10m vs KITTI 0-80m) by normalizing to
+        # [0, depth_scale] using each source's depth_norm_max.
+        if self.depth_norm_max is not None and self.depth_norm_max > 0:
+            depth = depth / self.depth_norm_max * self.depth_scale
         return depth
 
     @staticmethod
@@ -408,6 +528,10 @@ class DepthSegmentDataset(BaseDataset):
         label.pop("depth_scaleup", None)
         label.pop("depth_new_shape", None)
 
+        # Tag sample with source identifier for multi-source training
+        if self.source_tag:
+            label["source_tag"] = self.source_tag
+
         # Remove any None-valued keys to prevent collate_fn issues
         for k in list(label.keys()):
             if label[k] is None:
@@ -428,9 +552,22 @@ class DepthSegmentDataset(BaseDataset):
             if k in {"img", "sem_masks"}:
                 value = torch.stack(value, 0)
             elif k == "depth":
+                # Defensive: ensure all depths have the same HxW shape
+                shapes = {v.shape for v in value}
+                if len(shapes) > 1:
+                    target_h = max(v.shape[0] for v in value)
+                    target_w = max(v.shape[1] for v in value)
+                    value = tuple(
+                        cv2.copyMakeBorder(v, 0, target_h - v.shape[0], 0, target_w - v.shape[1],
+                                          cv2.BORDER_CONSTANT, value=0) if v.shape != (target_h, target_w) else v
+                        for v in value
+                    )
                 value = torch.from_numpy(np.stack(value)).float()
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
+            elif k == "source_tag":
+                # Keep source tags as a list for per-sample reference in loss
+                value = list(value)
             if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
                 if any(v is None for v in value):
                     raise ValueError(f"Key '{k}' contains None values: {value}")

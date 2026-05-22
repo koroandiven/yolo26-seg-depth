@@ -7,10 +7,17 @@
 # Parameters
 nc: 80 # number of classes
 depth_nc: 1 # depth channels
-depth_scale: 20.0 # depth output range in meters (NYU indoor scenes ~0-10m)
+depth_scale: 100.0 # unified depth output range for NYU (0-10m) + KITTI (0-80m) mixed training
 decouple_p4p5: False # disable P4/P5 task decoupling to fix spatial bias and box_loss
 end2end: True # whether to use end-to-end mode
 reg_max: 1 # DFL bins
+
+# Depth decoder hyperparameters
+decoder_dropout: 0.2        # Dropout2d in depth residual blocks (increased for regularization)
+use_multi_film: True        # Per-block FiLM modulation
+use_rgb_refine: True        # RGB-guided refinement at full resolution
+use_p2_skip: True           # High-resolution P2 skip connection in depth decoder
+use_log_depth: False        # Predict depth in log-space (exp(raw_output)) instead of linear sigmoid
 scales: # model compound scaling constants
   # [depth, width, max_channels]
   # n: [0.50, 0.25, 1024]
@@ -52,4 +59,4 @@ head:
   - [[-1, 10], 1, Concat, [1]] # cat head P5
   - [-1, 1, C3k2, [1024, True, 0.5, True]] # 22 (P5/32-large)
 
-  - [[16, 19, 22], 1, DepthSegment26, [nc, 32, 256]] # DepthSegment26(P3, P4, P5)
+  - [[2, 16, 19, 22], 1, DepthSegment26, [nc, 32, 256]] # DepthSegment26(P2, P3, P4, P5)

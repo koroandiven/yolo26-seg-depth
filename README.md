@@ -113,10 +113,11 @@ python yolo26_inference.py \
 ### 视频推理
 
 ```bash
-python yolo26_inference.py \
-  --model runs/segment/runs/train_depth/yolo26-seg-depth-exp16/weights/best.pt \
-  --source video.mp4 \
-  --device 0
+python yolo26_inference.py --model runs/segment/runs/train_depth/yolo26-seg-depth-exp16/weights/best.pt --source video.mp4 --device 0
+```
+
+```bash
+python .\yolo26_inference.py --model runs\segment\runs\train_depth\yolo26-seg-depth-exp5\weights\best.pt --webcam --camera-id 1
 ```
 
 ### Python API

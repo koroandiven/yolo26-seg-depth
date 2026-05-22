@@ -594,6 +594,7 @@ class SegmentationModel(DetectionModel):
                 self.depth_weight,
                 getattr(self, "use_gradnorm", False),
                 getattr(self, "freeze_seg", False),
+                use_log_depth=getattr(self, "use_log_depth", False),
             )
         return E2ELoss(self, v8SegmentationLoss) if getattr(self, "end2end", False) else v8SegmentationLoss(self)
 
@@ -1720,6 +1721,11 @@ def parse_model(d, ch, verbose=True):
             if m is DepthSegment26:
                 args.append(d.get("depth_scale", 100.0))
                 args.append(d.get("decouple_p4p5", True))
+                args.append(d.get("decoder_dropout", 0.1))
+                args.append(d.get("use_multi_film", True))
+                args.append(d.get("use_rgb_refine", True))
+                args.append(d.get("use_p2_skip", False))
+                args.append(d.get("use_log_depth", False))
             if m in {
                 Detect,
                 YOLOEDetect,

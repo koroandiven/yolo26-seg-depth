@@ -103,11 +103,7 @@ python yolo26_train_depth.py \
 ### 单图推理
 
 ```bash
-python yolo26_inference.py \
-  --model runs/segment/runs/train_depth/yolo26-seg-depth-exp16/weights/best.pt \
-  --source image.jpg \
-  --device 0 \
-  --save result.jpg
+python yolo26_inference.py --model runs/segment/runs/train_depth/yolo26-seg-depth-exp5/weights/best.pt --source archive\000046.jpg --device 0 --save archive\inference_results\combined.jpg
 ```
 
 ### 视频推理

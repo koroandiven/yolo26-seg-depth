@@ -8,7 +8,7 @@ __pycache__/
 *.egg-info/
 
 # Training runs (large files)
-runs/
+#runs/
 
 # Model weights (large binaries)
 # *.pt

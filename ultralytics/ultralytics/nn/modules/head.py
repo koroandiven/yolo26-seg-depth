@@ -1863,7 +1863,9 @@ class DepthResidualBlock(nn.Module):
 
     def forward(self, x):
         out = self.conv2(self.conv1(x))
-        out = self.drop(out)
+        drop = getattr(self, "drop", None)
+        if drop is not None:
+            out = drop(out)
         return self.act(x + out)
 
 
@@ -2096,7 +2098,7 @@ class MaskGuidedDepthDecoder(nn.Module):
             )
         feat = self.guidance_encoder(mask_guidance.detach())
 
-        if self.use_multi_film and self.film_heads is not None and stage < len(self.film_heads):
+        if getattr(self, "use_multi_film", False) and getattr(self, "film_heads", None) is not None and stage < len(self.film_heads):
             gamma = self.film_heads[stage]["gamma"](feat)
             beta = self.film_heads[stage]["beta"](feat)
         else:
@@ -2105,7 +2107,11 @@ class MaskGuidedDepthDecoder(nn.Module):
         return gamma, beta
 
     def forward(self, features, mask_guidance=None, rgb=None):
-        if self.use_p2_skip and len(features) >= 4:
+        # Older pickled checkpoints may lack use_p2_skip; infer from skip_p2 module.
+        use_p2 = getattr(self, "use_p2_skip", None)
+        if use_p2 is None:
+            use_p2 = getattr(self, "skip_p2", None) is not None
+        if use_p2 and len(features) >= 4:
             p2, p3, p4, p5 = features[0], features[1], features[2], features[3]
         else:
             p2 = None
@@ -2129,7 +2135,7 @@ class MaskGuidedDepthDecoder(nn.Module):
             depth_feat = depth_feat * (1.0 + gamma) + beta
             depth_feat = block(depth_feat)
 
-        if self.use_p2_skip and p2 is not None:
+        if use_p2 and p2 is not None:
             # Multi-stage upsample: 80 -> 160 -> 320 -> 640
             depth_feat = self.up_2x_1(depth_feat)  # 80 -> 160
             p2_proj = self.skip_p2(p2)
@@ -2157,7 +2163,7 @@ class MaskGuidedDepthDecoder(nn.Module):
             depth = self.depth_up(depth)
             depth = self.depth_refine(depth)
 
-            if self.use_rgb_refine and self.rgb_refine is not None and rgb is not None:
+            if getattr(self, "use_rgb_refine", False) and getattr(self, "rgb_refine", None) is not None and rgb is not None:
                 depth = depth + self.rgb_refine(depth, rgb)
 
         return depth
@@ -2219,8 +2225,17 @@ class DepthSegment26(Segment26):
             use_p2_skip=use_p2_skip,
         )
 
-        # Batch cache for training mask guidance (set by BaseModel.loss)
-        self._cached_batch = None
+        # Raw input image, stashed by BaseModel.forward before the backbone runs
+        # and consumed by the RGB-guided refinement path in forward()
+        self._input_img = None
+        # Depth-path tensors stashed during training forwards for the
+        # flip-consistency (symmetry) loss; cleared by eval forwards
+        self._depth_path_feats = None
+        self._seg_guidance = None
+
+    def set_input_img(self, img):
+        """Stash the model input image (called by BaseModel.forward) for RGB-guided depth refinement."""
+        self._input_img = img
 
     @staticmethod
     def _extract_seg_guidance(outputs, top_k: int = 16, score_thr: float = 0.05):
@@ -2415,6 +2430,11 @@ class DepthSegment26(Segment26):
         # getattr default=True for backward compatibility with old checkpoints
         decouple_p4p5 = getattr(self, "decouple_p4p5", True)
         use_p2_skip = getattr(self, "use_p2_skip", False)
+        if not self.training:
+            # Drop stale training-time stashes so eval-time consumers (e.g. the
+            # validation loss) never pick up tensors from an old training batch.
+            self._depth_path_feats = None
+            self._seg_guidance = None
 
         # When P2 skip is active, x[0] = P2, x[1] = P3, x[2] = P4, x[3] = P5
         # Otherwise, x[0] = P3, x[1] = P4, x[2] = P5
@@ -2451,38 +2471,44 @@ class DepthSegment26(Segment26):
         # Use segmentation-head proto guidance, not GT masks, so train/eval
         # consume the same information source. Guidance is detached inside the
         # decoder to protect the frozen segmentation path.
-        seg_guidance = self._extract_seg_guidance(outputs)
+        # Export/BPU: skip topk/bmm guidance; FiLM falls back to learned defaults.
+        seg_guidance = None if getattr(self, "export", False) else self._extract_seg_guidance(outputs)
 
-        # Retrieve RGB image from cached batch for RGB-guided refinement
-        rgb = None
-        if self._cached_batch is not None:
-            rgb = self._cached_batch.get("img")
-        cached_batch_for_tta = self._cached_batch
-        self._cached_batch = None  # GT mask guidance is intentionally unused
+        # Retrieve the raw input image for RGB-guided refinement. It is stashed
+        # by BaseModel.forward before the backbone runs, so train/val/predict
+        # and export all feed real RGB (previously only the training path did,
+        # via a loss-side batch cache, and every other path ran on zeros).
+        rgb = getattr(self, "_input_img", None)
 
         depth = self.mask_guided_depth_decoder(x_depth, seg_guidance, rgb=rgb)
-        if self.use_log_depth:
+        use_log_depth = getattr(self, "use_log_depth", False)
+        depth_scale = getattr(self, "depth_scale", 100.0)
+        if use_log_depth:
             depth = torch.exp(torch.clamp(depth, max=20))  # log-space depth prediction
         else:
-            depth = torch.sigmoid(depth) * self.depth_scale  # normalize to [0, depth_scale] meters
+            depth = torch.sigmoid(depth) * depth_scale  # normalize to [0, depth_scale] meters
 
         # Test-Time Augmentation (TTA): average with flipped prediction
-        if augment and not self.training:
+        if augment and not self.training and not getattr(self, "export", False):
             # Flip features horizontally
             x_depth_flipped = [torch.flip(f, dims=[-1]) for f in x_depth]
             seg_guidance_flipped = torch.flip(seg_guidance, dims=[-1]) if seg_guidance is not None else None
             rgb_flipped = torch.flip(rgb, dims=[-1]) if rgb is not None else None
             depth_flipped = self.mask_guided_depth_decoder(x_depth_flipped, seg_guidance_flipped, rgb=rgb_flipped)
-            if self.use_log_depth:
+            if use_log_depth:
                 depth_flipped = torch.exp(torch.clamp(depth_flipped, max=20))
             else:
-                depth_flipped = torch.sigmoid(depth_flipped) * self.depth_scale
+                depth_flipped = torch.sigmoid(depth_flipped) * depth_scale
             depth_flipped = torch.flip(depth_flipped, dims=[-1])
             depth = (depth + depth_flipped) * 0.5
 
         if self.training:
             if isinstance(outputs, dict):
                 outputs["depth"] = depth
+            # Stash depth-path tensors so the symmetry loss can re-run the
+            # decoder on flipped features without a second backbone pass
+            self._depth_path_feats = x_depth
+            self._seg_guidance = seg_guidance
             return outputs
 
         # Eval mode: store depth for external retrieval, return standard format
@@ -2492,6 +2518,12 @@ class DepthSegment26(Segment26):
         # Inject depth into preds_dict so that validation loss / metrics can access it
         if isinstance(outputs, tuple) and len(outputs) == 2 and isinstance(outputs[1], dict):
             outputs[1]["depth"] = depth
+
+        # Export: keep depth as an explicit graph output for ONNX/BPU (det, proto, depth)
+        if getattr(self, "export", False):
+            if isinstance(outputs, tuple) and len(outputs) == 2:
+                return outputs[0], outputs[1], depth
+            return outputs, depth
 
         return outputs
 

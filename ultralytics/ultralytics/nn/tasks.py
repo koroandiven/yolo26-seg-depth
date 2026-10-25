@@ -142,6 +142,10 @@ class BaseModel(torch.nn.Module):
         """
         if isinstance(x, dict):  # for cases of training and validating while training.
             return self.loss(x, *args, **kwargs)
+        # Stash the raw input image for heads that consume it (RGB-guided depth
+        # refinement), so train/val/predict/export all see the same RGB.
+        if hasattr(self.model[-1], "set_input_img"):
+            self.model[-1].set_input_img(x)
         return self.predict(x, *args, **kwargs)
 
     def predict(self, x, profile=False, visualize=False, augment=False, embed=None):
@@ -334,16 +338,7 @@ class BaseModel(torch.nn.Module):
             self.criterion = self.init_criterion()
 
         if preds is None:
-            # Cache batch for mask-guided depth head (consumed in forward)
-            head = self.model[-1]
-            if hasattr(head, "_cached_batch"):
-                head._cached_batch = batch
-            try:
-                preds = self.forward(batch["img"])
-            finally:
-                # Always clear cached batch to prevent memory leak on exception
-                if hasattr(head, "_cached_batch"):
-                    head._cached_batch = None
+            preds = self.forward(batch["img"])
         return self.criterion(preds, batch)
 
     def init_criterion(self):
@@ -592,8 +587,8 @@ class SegmentationModel(DetectionModel):
             return DepthSegmentationLoss(
                 self,
                 self.depth_weight,
-                getattr(self, "use_gradnorm", False),
                 getattr(self, "freeze_seg", False),
+                sym_weight=getattr(self, "sym_weight", 0.0),
                 use_log_depth=getattr(self, "use_log_depth", False),
             )
         return E2ELoss(self, v8SegmentationLoss) if getattr(self, "end2end", False) else v8SegmentationLoss(self)

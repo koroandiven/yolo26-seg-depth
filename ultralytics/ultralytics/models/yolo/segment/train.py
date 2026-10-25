@@ -34,6 +34,7 @@ class DepthSegmentValidator(SegmentationValidator):
         self.depth_metric = DepthMetric()
         self.source_depth_metrics = {}
         self.source_depth_losses = {}
+        self._depth_updates = 0  # batches that fed depth_metric; gates fitness
 
     def _prepare_pred(self, pred):
         # No-op to keep compatibility; depth preds are handled in update_metrics
@@ -62,18 +63,27 @@ class DepthSegmentValidator(SegmentationValidator):
                     depth_pred = depth_pred.squeeze(1)
                 elif depth_pred.dim() == 4 and depth_target.dim() == 4:
                     depth_target = depth_target.squeeze(1)
-                # Resize depth_target to match depth_pred if sizes differ (rect mode)
+                # Resize depth_target to match depth_pred if sizes differ (rect mode).
+                # Masked resize: plain bilinear leaks zero padding (LetterBox borders)
+                # into valid cells as fake low depths; renormalize by the interpolated
+                # mask and only trust fully-valid cells.
                 if depth_pred.shape != depth_target.shape:
                     import torch.nn.functional as F
 
-                    depth_target = F.interpolate(
-                        depth_target.unsqueeze(1),
+                    vm = (depth_target > 0).float().unsqueeze(1)
+                    t = F.interpolate(
+                        depth_target.unsqueeze(1) * vm,
                         size=depth_pred.shape[-2:],
                         mode="bilinear",
                         align_corners=False,
-                    ).squeeze(1)
-                valid_mask = depth_target > 0
+                    )
+                    m = F.interpolate(vm, size=depth_pred.shape[-2:], mode="bilinear", align_corners=False)
+                    depth_target = (t / m.clamp_min(1e-6)).squeeze(1)
+                    valid_mask = (m > 0.999).squeeze(1)
+                else:
+                    valid_mask = depth_target > 0
                 if valid_mask.any():
+                    self._depth_updates += 1
                     self.depth_metric.update(depth_pred[valid_mask], depth_target[valid_mask])
                 # Per-source depth metrics for multi-source training
                 source_tags = batch.get("source_tag")
@@ -130,6 +140,11 @@ class DepthSegmentValidator(SegmentationValidator):
                 "depth/delta2": depth_results["delta2"],
                 "depth/delta3": depth_results["delta3"],
             })
+            # Rank checkpoints by depth quality, not by segmentation mAP: the
+            # seg path is a frozen COCO head, so its mAP on NYU is noise near
+            # zero and cannot rank epochs (previously best.pt was argmax(noise)).
+            if getattr(self, "_depth_updates", 0) > 0:
+                stats["fitness"] = float(depth_results["delta1"] - 0.5 * depth_results["abs_rel"])
         for tag, metric in getattr(self, "source_depth_metrics", {}).items():
             src_res = metric.compute()
             stats[f"depth/{tag}/abs_rel"] = src_res["abs_rel"]
@@ -205,7 +220,10 @@ class DepthSegmentTrainer(SegmentationTrainer):
             overrides = {}
         overrides["task"] = "segment"
         super().__init__(cfg, overrides, _callbacks)
-        self.use_gradnorm = getattr(self.args, "use_gradnorm", False)
+        self.sym_weight = getattr(self.args, "sym_weight", 0.0)
+        self.sp_weight = float(getattr(self, "sp_weight", 0.0) or 0.0)
+        self.unfreeze_backbone_at = int(getattr(self, "unfreeze_backbone_at", -1) or -1)
+        self.backbone_lr_scale = float(getattr(self, "backbone_lr_scale", 1.0) or 1.0)
         self.depth_weight = getattr(self.args, "depth_weight", 0.5)
         self.freeze_seg = getattr(self.args, "freeze_seg", True)
 
@@ -232,8 +250,23 @@ class DepthSegmentTrainer(SegmentationTrainer):
         elif weights:
             model.load(weights)
 
+        # L2-SP anchor: snapshot backbone/neck pretrained weights (after pretrained load)
+        sp_weight = float(getattr(self, "sp_weight", 0.0) or 0.0)
+        unfreeze_at = int(getattr(self, "unfreeze_backbone_at", -1) or -1)
+        if sp_weight > 0 or unfreeze_at >= 0:
+            head_prefix = f"model.{len(model.model) - 1}."
+            model.sp_reference = {
+                n: p.detach().clone()
+                for n, p in model.named_parameters()
+                if not n.startswith(head_prefix)
+            }
+        model.sp_weight = sp_weight
         model.depth_weight = self.depth_weight
-        model.use_gradnorm = self.use_gradnorm
+        model.sym_weight = self.sym_weight
+        # Mirror the head's depth_scale onto the wrapper so build_dataset picks it up
+        head = model.model[-1] if hasattr(model, "model") else None
+        if head is not None and hasattr(head, "depth_scale"):
+            model.depth_scale = head.depth_scale
         model.freeze_seg = self.freeze_seg
         # Do NOT pre-initialize criterion here - model may still be on CPU.
         # Lazy initialization in BaseModel.loss() ensures correct device.
@@ -271,7 +304,26 @@ class DepthSegmentTrainer(SegmentationTrainer):
                 else:
                     p.requires_grad = False  # cv2/cv3/cv4/cv5/proto/dfl frozen
         LOGGER.info("Frozen seg head detection params, depth BN adaptive, depth components trainable")
-        return super().build_optimizer(model, name, lr, momentum, decay, iterations)
+        optimizer = super().build_optimizer(model, name, lr, momentum, decay, iterations)
+        bb_scale = float(getattr(self, "backbone_lr_scale", 1.0) or 1.0)
+        if bb_scale != 1.0:
+            model_u = unwrap_model(model)
+            head_prefix = f"model.{len(model_u.model) - 1}."
+            name_of = {id(p): n for n, p in model_u.named_parameters()}
+            for pg in optimizer.param_groups:
+                bb_params = [p for p in pg["params"] if not name_of[id(p)].startswith(head_prefix)]
+                head_params = [p for p in pg["params"] if name_of[id(p)].startswith(head_prefix)]
+                if bb_params and head_params:
+                    base_lr = pg["lr"]
+                    pg["params"] = head_params
+                    new_pg = {k: v for k, v in pg.items() if k != "params"}
+                    new_pg["params"] = bb_params
+                    new_pg["lr"] = base_lr * bb_scale
+                    optimizer.add_param_group(new_pg)
+                elif bb_params:
+                    pg["lr"] = pg["lr"] * bb_scale
+            LOGGER.info(f"Backbone/neck params use lr scaled by {bb_scale} (backbone_lr_scale)")
+        return optimizer
 
     def _model_train(self):
         """Persist seg-head BN freeze across epochs after base _model_train resets everything."""
@@ -336,6 +388,7 @@ class DepthSegmentTrainer(SegmentationTrainer):
                     depth_max=cfg.get("depth_max", depth_scale),
                     depth_norm_max=cfg.get("depth_norm_max", None),
                     source_tag=tag,
+                    depth_mosaic_p=float(getattr(self.args, 'depth_mosaic', 0.0) or 0.0),
                 )
                 datasets.append(ds)
             if len(datasets) == 0:
@@ -373,6 +426,7 @@ class DepthSegmentTrainer(SegmentationTrainer):
             data=self.data,
             fraction=self.args.fraction if mode == "train" else 1.0,
             depth_scale=depth_scale,
+            depth_mosaic_p=float(getattr(self.args, 'depth_mosaic', 0.0) or 0.0),
         )
 
     def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train"):
@@ -410,18 +464,18 @@ class DepthSegmentTrainer(SegmentationTrainer):
         """Validate model, ensuring EMA model uses DepthSegmentationLoss."""
         if self.ema and self.ema.ema:
             self.ema.ema.depth_weight = self.depth_weight
-            self.ema.ema.use_gradnorm = self.use_gradnorm
+            self.ema.ema.sym_weight = self.sym_weight
             self.ema.ema.freeze_seg = self.freeze_seg
-            self.ema.ema.depth_scale = getattr(self.model, "depth_scale", 20.0)
             if getattr(self.ema.ema, "criterion", None) is None:
                 self.ema.ema.criterion = self.ema.ema.init_criterion()
             elif hasattr(self.ema.ema.criterion, "freeze_seg"):
                 self.ema.ema.criterion.freeze_seg = self.freeze_seg
+                self.ema.ema.criterion.sym_weight = self.sym_weight
         return super().validate()
 
     def get_validator(self):
         """Return multi-task validator."""
-        self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "sem_loss", "depth_loss"
+        self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "sem_loss", "depth_loss", "sym_loss"
         return DepthSegmentValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

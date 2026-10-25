@@ -1708,9 +1708,7 @@ class MultiScaleDepthLoss(nn.Module):
             valid_mask = valid_mask.unsqueeze(1)
         # Rect validation: pred and target may have different spatial sizes.
         if pred.shape[-2:] != target.shape[-2:]:
-            target = F.interpolate(target, size=pred.shape[-2:], mode="bilinear", align_corners=False)
-            if valid_mask is not None:
-                valid_mask = F.interpolate(valid_mask.float(), size=pred.shape[-2:], mode="nearest") > 0.5
+            target, valid_mask = _resize_depth_target(target, valid_mask, pred.shape[-2:])
 
         # Label smoothing: add tiny Gaussian noise to depth target to prevent
         # overfitting exact pixel values.
@@ -1721,11 +1719,8 @@ class MultiScaleDepthLoss(nn.Module):
         for scale in self.scales:
             if scale != 1.0:
                 pred_s = F.interpolate(pred, scale_factor=scale, mode="bilinear", align_corners=False)
-                target_s = F.interpolate(target, scale_factor=scale, mode="bilinear", align_corners=False)
-                if valid_mask is not None:
-                    valid_mask_s = F.interpolate(valid_mask.float(), scale_factor=scale, mode="nearest") > 0.5
-                else:
-                    valid_mask_s = None
+                size_s = (int(round(pred.shape[-2] * scale)), int(round(pred.shape[-1] * scale)))
+                target_s, valid_mask_s = _resize_depth_target(target, valid_mask, size_s)
             else:
                 pred_s, target_s = pred, target
                 valid_mask_s = valid_mask
@@ -1762,63 +1757,41 @@ class MultiScaleDepthLoss(nn.Module):
         return total_loss
 
 
-class GradNormLoss(nn.Module):
-    """Gradient normalization dynamic weight mechanism."""
+def _resize_depth_target(target, valid_mask, size):
+    """Masked bilinear resize of a depth map.
 
-    def __init__(self, model, loss_names, initial_weights, alpha=1.5):
-        super().__init__()
-        self.model = model
-        self.loss_names = loss_names
-        self.initial_weights = [w for w in initial_weights]
-        self.alpha = alpha
-        self.weights = nn.Parameter(torch.tensor(initial_weights, dtype=torch.float32))
-        self.loss_history = {name: [] for name in loss_names}
+    Plain bilinear interpolation leaks zero padding (LetterBox borders, invalid
+    pixels) into neighbouring valid cells as fake low depths. Interpolating
+    depth x mask and renormalizing by the interpolated mask avoids this, and
+    cells that are not fully valid after resizing are marked invalid.
+    """
+    vm = valid_mask.to(dtype=torch.float32) if valid_mask is not None else torch.ones_like(target, dtype=torch.float32)
+    t = F.interpolate(target * vm, size=size, mode="bilinear", align_corners=False)
+    m = F.interpolate(vm, size=size, mode="bilinear", align_corners=False)
+    t = t / m.clamp_min(1e-6)
+    if valid_mask is None:
+        return t, None
+    return t, m > 0.999
 
-    def update_weights(self, losses):
-        """Update task weights (should be called after backward).
 
-        Args:
-            losses: dict {task_name: loss_value}
-
-        Returns:
-            Weighted total loss
-        """
-        for name in self.loss_names:
-            self.loss_history[name].append(losses[name].item() if hasattr(losses[name], "item") else losses[name])
-
-        total_loss = 0.0
-        for i, name in enumerate(self.loss_names):
-            total_loss = total_loss + self.weights[i] * losses[name]
-
-        return total_loss
-
-    def compute_grad_norm(self):
-        """Compute gradient norms for each task (call after backward)."""
-        grad_norms = []
-        for name in self.loss_names:
-            param = list(self.model.parameters())[0]
-            grad_norm = param.grad.norm().item() if param.grad is not None else 0.0
-            grad_norms.append(grad_norm)
-        return grad_norms
-
-    def step(self, losses):
-        """Execute weight update (call after optimizer.step())."""
-        with torch.no_grad():
-            grad_norms = self.compute_grad_norm()
-            avg_grad = sum(grad_norms) / len(grad_norms) if grad_norms else 1.0
-            for i in range(len(self.weights)):
-                self.weights[i] = self.weights[i] * (grad_norms[i] / (avg_grad + 1e-8)) ** self.alpha
-        return self.weights.detach()
 
 
 class DepthSegmentationLoss(v8SegmentationLoss):
-    """Segmentation + Depth joint loss (with dynamic weights + multi-scale loss)."""
+    """Segmentation + Depth joint loss.
 
-    def __init__(self, model, depth_weight=0.5, use_gradnorm=False, freeze_seg=False, tal_topk=10, tal_topk2=None, use_log_depth=False):
+    When freeze_seg=True, the segmentation loss is skipped entirely: the seg
+    path is frozen, its log values were zeroed anyway, and computing the
+    assignment + mask losses every batch was pure overhead. An optional
+    flip-consistency term (sym_weight) regularizes depth prediction symmetry.
+    """
+
+    def __init__(self, model, depth_weight=0.5, freeze_seg=False, sym_weight=0.0, tal_topk=10, tal_topk2=None, use_log_depth=False):
         super().__init__(model, tal_topk, tal_topk2)
-        self.use_gradnorm = use_gradnorm
         self.depth_weight = depth_weight
         self.freeze_seg = freeze_seg
+        self.sym_weight = sym_weight
+        self.head = model.model[-1]  # DepthSegment26 head; stashes depth-path tensors each train forward
+        self.model = model  # kept for the L2-SP regularizer
         self.depth_loss_fn = MultiScaleDepthLoss(
             scales=(1.0, 0.5),
             edge_weight=0.6,
@@ -1829,16 +1802,8 @@ class DepthSegmentationLoss(v8SegmentationLoss):
             silog_weight=1.3,
             use_log_depth=use_log_depth,
         )
-        self._loss_names = ["box", "seg", "cls", "dfl", "semseg", "depth"]
+        self._loss_names = ["box", "seg", "cls", "dfl", "semseg", "depth", "sym"]
         self.updates = 0  # for resume compatibility with end2end training
-
-        if use_gradnorm:
-            self.gradnorm = GradNormLoss(
-                model,
-                loss_names=["seg", "depth"],
-                initial_weights=[1.0, depth_weight],
-                alpha=1.5,
-            )
 
     def update(self) -> None:
         """No-op update for resume compatibility (end2end expects this method)."""
@@ -1847,11 +1812,8 @@ class DepthSegmentationLoss(v8SegmentationLoss):
     def loss(self, preds, batch):
         """Compute segmentation + depth joint loss.
 
-        When freeze_seg=True, segmentation loss is computed without gradients
-        to prevent NYU semantic labels from corrupting COCO pretrained backbone.
-
         Returns:
-            tuple: (total_loss, loss_items) where loss_items = [box, seg, cls, dfl, semseg, depth]
+            tuple: (total_loss, loss_items) where loss_items = [box, seg, cls, dfl, semseg, depth, sym]
         """
         # Eval mode: preds may be a tuple ((y, proto), preds_dict) from Segment26.
         # Extract the preds_dict which contains the depth key.
@@ -1863,64 +1825,94 @@ class DepthSegmentationLoss(v8SegmentationLoss):
         if isinstance(preds, dict) and "one2many" in preds:
             seg_preds = preds["one2many"]
 
-        if self.freeze_seg:
-            # Block segmentation gradients from flowing back to backbone/seg head
-            with torch.no_grad():
-                seg_loss, loss_items = super().loss(seg_preds, batch)
-            seg_loss_val = seg_loss.sum().detach()
-            # Zero out seg loss items to prevent frozen seg losses from polluting logs
-            if loss_items.numel() >= 5:
-                loss_items[:5] = 0.0
-            elif loss_items.numel() >= 4:
-                loss_items[:4] = 0.0
-        else:
+        seg_loss_val = None
+        loss_items = None
+        if not self.freeze_seg:
             seg_loss, loss_items = super().loss(seg_preds, batch)
             seg_loss_val = seg_loss.sum()
 
         # Depth loss uses original preds (which has depth key)
+        device = batch["img"].device
         depth_pred = preds.get("depth") if isinstance(preds, dict) else None
-        if depth_pred is not None:
-            depth_target = batch.get("depth")
-            if depth_target is not None:
-                depth_target = depth_target.to(depth_pred.device)
-                # valid_mask: ignore pixels where depth_target == 0 (missing/invalid depth)
-                valid_mask = depth_target > 0
-                masks = batch.get("masks")
-                batch_idx = batch.get("batch_idx")
-                img = batch.get("img")
-                d_loss = self.depth_loss_fn(depth_pred, depth_target, masks=masks, batch_idx=batch_idx, valid_mask=valid_mask, img=img)
+        d_loss = None
+        sym_loss = None
+        if depth_pred is not None and batch.get("depth") is not None:
+            depth_target = batch["depth"].to(depth_pred.device)
+            # valid_mask: ignore pixels where depth_target == 0 (missing/invalid depth)
+            valid_mask = depth_target > 0
+            d_loss = self.depth_loss_fn(
+                depth_pred,
+                depth_target,
+                masks=batch.get("masks"),
+                batch_idx=batch.get("batch_idx"),
+                valid_mask=valid_mask,
+                img=batch.get("img"),
+            )
+            if self.sym_weight > 0:
+                sym_loss = self._symmetry_loss(depth_pred, depth_target, valid_mask, img=batch.get("img"))
 
-                if self.use_gradnorm:
-                    losses = {"seg": seg_loss_val, "depth": d_loss}
-                    total_loss = self.gradnorm.update_weights(losses)
-                else:
-                    # Phase 1: seg head frozen, seg_loss has no grad_fn.
-                    # Only use depth_loss to ensure total_loss has grad_fn.
-                    if seg_loss_val.requires_grad:
-                        total_loss = seg_loss_val + self.depth_weight * d_loss
-                    else:
-                        total_loss = self.depth_weight * d_loss
+        # Assemble per-component items: [box, seg, cls, dfl, semseg, depth, sym]
+        if loss_items is not None and loss_items.numel() >= 5:
+            seg_items = loss_items[:5]
+        elif loss_items is not None:
+            seg_items = torch.cat([loss_items[:4], torch.zeros(1, device=loss_items.device)])
+        else:
+            seg_items = torch.zeros(5, device=device)
+        depth_item = d_loss.detach().reshape(1).to(device) if d_loss is not None else torch.zeros(1, device=device)
+        sym_item = sym_loss.detach().reshape(1).to(device) if sym_loss is not None else torch.zeros(1, device=device)
+        combined_loss_items = torch.cat([seg_items.to(device), depth_item, sym_item])
 
-                depth_loss_item = d_loss.detach()
-                # Ensure all tensors are on the same device before cat
-                device = loss_items.device
-                depth_loss_item = depth_loss_item.to(device)
-                combined_loss_items = torch.cat(
-                    [
-                        loss_items[:4].to(device),
-                        loss_items[4:5].to(device) if loss_items.numel() >= 5 else torch.zeros(1, device=device),
-                        depth_loss_item.unsqueeze(0),
-                    ]
-                )
-                return total_loss, combined_loss_items
+        # Total: seg contributes only when it carries gradients (freeze_seg skips it).
+        total = torch.zeros((), device=device)
+        if seg_loss_val is not None and seg_loss_val.requires_grad:
+            total = total + seg_loss_val
+        if d_loss is not None:
+            total = total + self.depth_weight * d_loss
+        if sym_loss is not None:
+            total = total + self.sym_weight * sym_loss
+        # L2-SP: anchor (possibly unfrozen) backbone/neck weights to their pretrained
+        # values so depth gradients can adapt shared features without destroying the
+        # COCO segmentation capability they carry.
+        sp_ref = getattr(self.model, "sp_reference", None)
+        sp_w = float(getattr(self.model, "sp_weight", 0.0) or 0.0)
+        if sp_w > 0 and sp_ref:
+            penalty = total.new_zeros(())
+            for pname, p in self.model.named_parameters():
+                ref = sp_ref.get(pname)
+                if ref is not None and p.requires_grad:
+                    penalty = penalty + torch.mean((p - ref.to(p.device)) ** 2)
+            total = total + sp_w * penalty
+        return total, combined_loss_items
 
-        # Always return 6 loss items (append 0 for depth when not available)
-        device = loss_items.device
-        combined_loss_items = torch.cat(
-            [
-                loss_items[:4].to(device),
-                loss_items[4:5].to(device) if loss_items.numel() >= 5 else torch.zeros(1, device=device),
-                torch.zeros(1, device=device),
-            ]
-        )
-        return seg_loss, combined_loss_items
+    def _symmetry_loss(self, depth_pred, depth_target, valid_mask, img=None):
+        """Flip-consistency loss |D(x) - flip(D(flip(x)))| on valid pixels.
+
+        Directly targets the left/right symmetry diagnostic measured by
+        diagnose_depth.py. Re-runs only the depth decoder (not the backbone) on
+        horizontally flipped features stashed by the head during this forward.
+        """
+        head = getattr(self, "head", None)
+        feats = getattr(head, "_depth_path_feats", None) if head is not None else None
+        if feats is None:  # eval/validation forwards do not stash features
+            return None
+        guidance = getattr(head, "_seg_guidance", None)
+        rgb = img if img is not None else getattr(head, "_input_img", None)
+        depth_scale = getattr(head, "depth_scale", 100.0)
+        flipped_feats = [torch.flip(f, dims=[-1]) for f in feats]
+        flipped_guidance = torch.flip(guidance, dims=[-1]) if guidance is not None else None
+        flipped_rgb = torch.flip(rgb, dims=[-1]) if rgb is not None else None
+        d_flipped = head.mask_guided_depth_decoder(flipped_feats, flipped_guidance, rgb=flipped_rgb)
+        if getattr(head, "use_log_depth", False):
+            d_flipped = torch.exp(torch.clamp(d_flipped, max=20))
+        else:
+            d_flipped = torch.sigmoid(d_flipped) * depth_scale
+        d_flipped = torch.flip(d_flipped, dims=[-1])
+        if d_flipped.shape[-2:] != depth_pred.shape[-2:]:
+            d_flipped = F.interpolate(d_flipped, size=depth_pred.shape[-2:], mode="bilinear", align_corners=False)
+        diff = (depth_pred - d_flipped).abs()
+        vm = valid_mask
+        if vm.shape[-2:] != diff.shape[-2:]:
+            vm = F.interpolate(vm.float().unsqueeze(1), size=diff.shape[-2:], mode="nearest").squeeze(1) > 0.5
+        if not vm.any():
+            return diff.sum() * 0.0
+        return diff[vm.unsqueeze(1) if diff.dim() == 4 else vm].mean()

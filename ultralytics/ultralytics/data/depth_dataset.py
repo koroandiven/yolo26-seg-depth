@@ -23,7 +23,7 @@ from ultralytics.utils import LOCAL_RANK, LOGGER, TQDM
 from ultralytics.utils.instance import Instances
 from ultralytics.utils.ops import resample_segments, segments2boxes
 
-from .augment import Compose, Format, LetterBox, RandomHSV
+from .augment import Compose, Format, LetterBox, Mosaic, RandomHSV
 from .base import BaseDataset
 from .utils import get_hash, img2label_paths, load_dataset_cache_file, save_dataset_cache_file
 
@@ -172,7 +172,103 @@ class DepthSafeCutOut:
 
 
 
+class DepthMosaic(Mosaic):
+    """Geometry-consistent Mosaic for dense depth supervision.
+
+    Composes the depth maps of all 4 patches exactly like their images (same
+    quadrant placement; uncovered canvas stays 0 = invalid depth, mirroring the
+    114-gray image padding), then downsamples the 2*imgsz mosaic back to imgsz.
+    The uniform 2x downscale leaves normalized bboxes/segments unchanged and
+    keeps depth values (meters) valid. When skipped by probability, depth falls
+    back to the standard LetterBox geometry so it stays aligned with the image.
+    """
+
+    def __call__(self, labels):
+        """Apply mosaic with probability p; otherwise only letterbox the depth."""
+        if random.uniform(0, 1) > self.p:
+            if "depth" in labels and labels["depth"] is not None:
+                labels["depth"] = self.dataset._letterbox_depth(labels["depth"], labels)
+            return labels
+        indexes = self.get_indexes()
+        if isinstance(indexes, int):
+            indexes = [indexes]
+        mix_labels = [self.dataset.get_image_and_label(i) for i in indexes]
+        self._ensure_depth(labels)
+        for mix in mix_labels:
+            self._ensure_depth(mix)
+        labels["mix_labels"] = mix_labels
+        labels = self._update_label_text(labels)
+        labels = self._mix_transform(labels)
+        labels.pop("mix_labels", None)
+        return labels
+
+    def _ensure_depth(self, labels_patch):
+        """Attach a depth map (meters, same shape as the patch image) to a patch."""
+        if labels_patch.get("depth") is not None:
+            return
+        idx = labels_patch.get("index", None)
+        if idx is None:
+            im_file = labels_patch.get("im_file", None)
+            try:
+                idx = self.dataset.im_files.index(im_file)
+            except (ValueError, AttributeError):
+                idx = None
+        depth = None
+        if idx is not None and 0 <= idx < len(self.dataset.labels):
+            depth_file = self.dataset.labels[idx].get("depth_file", "")
+            if depth_file and Path(depth_file).exists():
+                depth = self.dataset.load_depth(depth_file)
+        img_h, img_w = labels_patch["img"].shape[:2]
+        if depth is None:
+            depth = np.zeros((img_h, img_w), dtype=np.float32)
+        if depth.shape[:2] != (img_h, img_w):
+            depth = cv2.resize(depth, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
+        labels_patch["depth"] = depth.astype(np.float32)
+
+    def _mosaic4(self, labels):
+        """Compose 4 image+depth patches and downscale the mosaic to imgsz."""
+        mosaic_labels = []
+        s = self.imgsz
+        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.border)  # mosaic center x, y
+        for i in range(4):
+            labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
+            # Load image and depth
+            img = labels_patch["img"]
+            depth = labels_patch["depth"]
+            h, w = labels_patch.pop("resized_shape")
+
+            # Place img/depth in the 2s x 2s canvas (same coordinates as stock Mosaic)
+            if i == 0:  # top left
+                img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)
+                depth4 = np.zeros((s * 2, s * 2), dtype=np.float32)
+                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
+            elif i == 1:  # top right
+                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+            elif i == 2:  # bottom left
+                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
+            else:  # bottom right
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+
+            img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
+            depth4[y1a:y2a, x1a:x2a] = depth[y1b:y2b, x1b:x2b]
+            padw = x1a - x1b
+            padh = y1a - y1b
+
+            labels_patch = self._update_labels(labels_patch, padw, padh)
+            mosaic_labels.append(labels_patch)
+        final_labels = self._cat_labels(mosaic_labels)
+        # Uniform 2x downscale back to the training size. Normalized instances are
+        # unaffected (no padding, equal scale on both axes); depth values in meters
+        # are resolution-independent.
+        final_labels["img"] = cv2.resize(img4, (s, s), interpolation=cv2.INTER_LINEAR)
+        final_labels["depth"] = cv2.resize(depth4, (s, s), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+        return final_labels
 class DepthSegmentDataset(BaseDataset):
+
     """Dataset class for Depth + Segmentation multi-task learning.
 
     Supports NYU Depth V2 format with:
@@ -206,6 +302,7 @@ class DepthSegmentDataset(BaseDataset):
         depth_scale: float = 100.0,
         depth_norm_max: float | None = None,
         source_tag: str = "",
+        depth_mosaic_p: float = 0.0,
         **kwargs,
     ):
         """Initialize DepthSegmentDataset.
@@ -231,6 +328,7 @@ class DepthSegmentDataset(BaseDataset):
         self.depth_norm_max = depth_norm_max
         self.data = data
         self.source_tag = source_tag
+        self.depth_mosaic_p = float(depth_mosaic_p or 0.0)
         super().__init__(*args, channels=3, **kwargs)
 
     def get_img_files(self, img_path: str) -> list:
@@ -400,6 +498,8 @@ class DepthSegmentDataset(BaseDataset):
             # and a depth-aware horizontal flip (essential to avoid left/right bias).
             fliplr_p = float(getattr(hyp, "fliplr", 0.5)) if hyp is not None else 0.5
             transforms_list = [
+                # Geometry-consistent mosaic for dense depth (opt-in via depth_mosaic_p)
+                *([DepthMosaic(self, imgsz=self.imgsz, p=self.depth_mosaic_p, n=4)] if self.depth_mosaic_p > 0 else []),
                 LetterBox(new_shape=(self.imgsz, self.imgsz)),
                 DepthRandomFlip(p=fliplr_p),
                 RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
@@ -522,7 +622,12 @@ class DepthSegmentDataset(BaseDataset):
         # Ultralytics transforms do not know how to transform dense depth targets.
         label["depth_new_shape"] = (self.imgsz, self.imgsz)
         label["depth_scaleup"] = self.augment
-        label["depth"] = self._letterbox_depth(depth, label)
+        if self.depth_mosaic_p > 0 and self.augment:
+            # DepthMosaic composes patches at this resolution and applies
+            # the final letterbox-equivalent downscale itself.
+            label["depth"] = depth.astype(np.float32)
+        else:
+            label["depth"] = self._letterbox_depth(depth, label)
 
         label = self.transforms(label)
         label.pop("depth_scaleup", None)

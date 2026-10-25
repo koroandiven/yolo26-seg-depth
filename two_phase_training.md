@@ -108,7 +108,32 @@ python yolo26_train_depth.py \
   若新体系保留了 COCO 原始 id 不变，也可继续用 COCO 验证集。
 - 训练期间的分割指标请查看运行目录下的 `coco_guard.csv`（护栏每 N epoch 测量一次）。
 
-### 3. 基线确认后再放开训练
+### 3. 关于翻转增强（重要，勿遗漏）
+
+**不需要、也不应把 NYU 数据集离线翻转预处理。** 训练管线内置
+`DepthRandomFlip`（`ultralytics/ultralytics/data/depth_dataset.py`），
+按 `fliplr` 概率在训练时对 **图像 + 深度图 + 实例标注三者同步做水平翻转**——
+翻转由数据管线在每个样本上在线完成，原始数据集保持原样。
+垂直翻转被明确禁止（会颠倒地板/天花板几何，深度无法自洽）。
+
+实验结论（exp14~exp16）：水平翻转是压制 Kinect 固定机位"左右深度偏置"的
+最有效手段，`--fliplr 0.4` 是已验证的甜点（asymmetry 0.431m → 0.317m，
+相对改善 26%；默认 0.5 也可接受）：
+
+```bash
+python yolo26_train_depth.py \
+    --model yolo26-seg-depth-nc90.yaml \
+    --data nyu_yolo/nyu_depth_seg.yaml \
+    --pretrained runs/segment/phase1_multiclass/weights/best.pt \
+    --name exp20-phase2 \
+    --fliplr 0.4 --sym-weight 0.1 \
+    --coco-guard-data multi_seg.yaml
+```
+
+`--fliplr`（数据层面的翻转）与 `--sym-weight`（损失层面的翻转一致性）互补，
+针对同一偏置问题，建议同时开启。
+
+### 4. 基线确认后再放开训练
 
 1. 先纯冻结跑 50~90 epoch，得到 Phase 2 基线；
 2. 确认 `coco_guard.csv` 中分割 mAP 稳定、无退化；
@@ -143,6 +168,7 @@ python yolo26_train_depth.py \
 
 | 参数 | 默认 | 作用 |
 |---|---|---|
+| `--fliplr` | hyp 默认 0.5 | 图像+深度+实例同步水平翻转概率；压制左右深度偏置，推荐 0.4 |
 | `--sym-weight` | 0.0 | 翻转一致性（对称）损失权重，针对左右深度偏置 |
 | `--depth-mosaic` | 0.0 | 几何一致 Mosaic 概率（深度四块拼接 + 2× 降采样） |
 | `--unfreeze-backbone-at` | -1 | 从第 N 个 epoch 起解冻 backbone/neck（-1 全程冻结） |

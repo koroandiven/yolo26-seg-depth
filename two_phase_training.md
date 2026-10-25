@@ -164,6 +164,53 @@ python yolo26_train_depth.py \
   （fitness = depth/delta1 − 0.5 × depth/abs_rel），结果以 results.csv 的
   `depth/*` 列与 `diagnose_depth.py` 的 asymmetry/edge_corr 为准。
 
+## 训练注意事项清单
+
+### 数据与配置
+
+1. **在仓库根目录启动训练**（`python yolo26_train_depth.py ...`）。
+   `nyu_yolo/nyu_depth_seg.yaml` 的 `path` 是相对路径；在服务器上训练时
+   改成服务器上的实际绝对路径。
+2. **深度管线的几何增强只有水平翻转和 `--depth-mosaic`**。标准 hyp 里的
+   `degrees/translate/scale/crop` 等空间增强对深度图不生效（被刻意排除，
+   避免几何不一致的错误监督），不要指望调它们。
+3. **NYU 单源训练的可选调优**：head 输出是 `sigmoid × depth_scale`（默认 100），
+   而 NYU 目标只有 0~10m，sigmoid 实际只用到底部 10% 区间。纯 NYU 训练可把
+   模型 yaml 的 `depth_scale` 改为 10 换取输出分辨率；**训练与部署必须保持
+   同一值**（导出 ONNX 时该值固化在图里）。多源混训（NYU+KITTI）保持 100，
+   并记得在 data yaml 里配 `depth_norm_max`（见 `nyu_kitti_mix.yaml`）。
+
+### 训练过程监控
+
+4. **`freeze_seg` 下 box/seg/cls/dfl/sem 损失恒为 0 是预期行为**
+   （分割被冻结，新代码直接跳过其计算）。训练是否健康看：
+   `train/depth_loss`、`val/depth_loss`、results.csv 的 `depth/*` 指标、
+   `coco_guard.csv`，以及线下 `diagnose_depth.py` 的 asymmetry/edge_corr。
+5. **显存占用明显高于 stock 分割训练**：稠密深度标签 (B,640,640)、输入图
+   stash、sym 损失的额外解码器前向、mosaic 的 2 倍尺寸张量。默认 batch=8
+   在 8GB 卡上可能紧张；OOM 时先降 batch，再考虑关闭 `--sym-weight` 或
+   `--depth-mosaic`。
+6. **护栏读数解读**：首次运行需下载/准备验证数据（coco128-seg 仅 128 张图，
+   mAP 绝对值低且抖动大属正常，**只看相对首次测量的跌幅**）；若新类别体系
+   重排了 COCO 的 id，护栏数据必须用同体系验证集（正文已述）。
+7. **解冻时机与学习率**：lr 按 one-cycle  schedule 随 epoch 衰减，
+   `--unfreeze-backbone-at` 越早，backbone 实际得到的绝对 lr 越大
+   （lr0 × lf(epoch) × backbone_lr_scale）。30/90 epoch 处解冻约为
+   lr0 中段的 0.1 倍，通常安全；再早需同步调小 `--backbone-lr-scale`。
+
+### 产出、恢复与部署
+
+8. **旧实验（exp5~exp16）的 best.pt 是按噪声选出的，不要直接复用其结论**
+   或与新实验的指标直接对比。旧 ckpt 可以在新代码下正常加载推理
+   （getattr 回退兼容），但：
+   - **部署前必须用新代码重新导出 ONNX**——旧 ONNX 把"RGB 分支跑零向量"
+     固化进了计算图，RGB 修复对它无效；
+   - 重新导出后重跑一次 `diagnose_depth.py`，确认 asymmetry 变化
+     （RGB 精修从死分支变为真正参与推理，指标会变）。
+9. `--resume` 仅适用于新代码基线上启动的 run；跨代码版本恢复旧实验请新开训练。
+10. 若未来启用 `use_log_depth: True`，注意 AMP fp16 下 `exp(raw)` 在
+    raw>11 时即溢出（65504 上限）；默认的 sigmoid 线性输出无此问题。
+
 ## 附：新增 CLI 参数速查
 
 | 参数 | 默认 | 作用 |

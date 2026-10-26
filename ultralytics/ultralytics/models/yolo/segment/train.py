@@ -21,10 +21,15 @@ class DepthSegmentValidator(SegmentationValidator):
     def init_metrics(self, model: torch.nn.Module) -> None:
         """Initialize metrics with COCO-scale confusion matrix and depth metrics."""
         super().init_metrics(model)
-        # The model predicts COCO 80 classes but validation data may have fewer.
-        # Expand confusion matrix to accommodate all COCO predictions.
-        if self.nc < 80:
-            self.nc = 80
+        # The model may predict more classes than the validation data (e.g. a 120-class
+        # head validated on NYU's 10 classes). Expand the confusion matrix to follow
+        # the model head, otherwise predictions outside the data's class range overflow it.
+        # ``nc`` is read through AutoBackend (final validation loads the checkpoint into
+        # an AutoBackend wrapper), so no module indexing is needed here.
+        model_nc = getattr(unwrap_model(model), "nc", None) or 0
+        target_nc = max(self.nc, model_nc, 80)
+        if target_nc != self.nc:
+            self.nc = target_nc
             from ultralytics.utils.metrics import ConfusionMatrix
 
             self.confusion_matrix = ConfusionMatrix(
@@ -435,6 +440,11 @@ class DepthSegmentTrainer(SegmentationTrainer):
         import numpy as np
 
         assert mode in {"train", "val"}, f"Mode must be 'train' or 'val', not {mode}."
+        if mode == "val" and self.args.batch and self.args.batch > 0:
+            # The core trainer doubles the validation batch; with the depth decoder the
+            # val batch is the memory peak of the whole run. Keep it equal to the
+            # configured train batch so a shared GPU does not OOM during validation.
+            batch_size = self.args.batch
         with torch_distributed_zero_first(rank):
             dataset = self.build_dataset(dataset_path, mode, batch_size)
         shuffle = mode == "train"

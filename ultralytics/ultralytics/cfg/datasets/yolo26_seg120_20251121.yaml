@@ -1,0 +1,127 @@
+# 20251121 多任务分割训练数据集 (120 类)
+path: /d01/training_data/yolov8_pipeline/datasets/20251121/merged
+train: ./images/train
+val:   ./images/val
+
+nc: 120
+names:
+  0: person
+  1: bicycle
+  2: car
+  3: motorcycle
+  4: airplane
+  5: bus
+  6: train
+  7: truck
+  8: boat
+  9: traffic light
+  10: fire hydrant
+  11: stop sign
+  12: parking meter
+  13: bench
+  14: bird
+  15: cat
+  16: dog
+  17: horse
+  18: animal-other
+  19: backpack
+  20: umbrella
+  21: handbag
+  22: tie
+  23: suitcase
+  24: frisbee
+  25: skis
+  26: snowboard
+  27: sports ball
+  28: kite
+  29: baseball bat
+  30: baseball glove
+  31: skateboard
+  32: surfboard
+  33: tennis racket
+  34: bottle
+  35: wine glass
+  36: cup
+  37: fork
+  38: knife
+  39: spoon
+  40: bowl
+  41: food
+  42: chair
+  43: couch
+  44: potted plant
+  45: bed
+  46: toilet
+  47: tv
+  48: laptop
+  49: mouse
+  50: remote
+  51: keyboard
+  52: cell phone
+  53: microwave
+  54: oven
+  55: toaster
+  56: sink
+  57: refrigerator
+  58: book
+  59: clock
+  60: vase
+  61: scissors
+  62: teddy bear
+  63: hair drier
+  64: toothbrush
+  65: banner
+  66: blanket
+  67: bridge
+  68: cardboard
+  69: counter
+  70: curtain
+  71: door-stuff
+  72: flower
+  73: fruit
+  74: gravel
+  75: house
+  76: light
+  77: mirror-stuff
+  78: net
+  79: pillow
+  80: playingfield
+  81: railroad
+  82: river
+  83: road
+  84: roof
+  85: sand
+  86: sea
+  87: shelf
+  88: snow
+  89: stairs
+  90: tent
+  91: towel
+  92: wall
+  93: water-other
+  94: window-blind
+  95: window-other
+  96: tree-merged
+  97: fence-merged
+  98: ceiling-merged
+  99: sky-other-merged
+  100: cabinet-merged
+  101: table-merged
+  102: floor
+  103: mountain-merged
+  104: grass-merged
+  105: dirt-merged
+  106: paper-merged
+  107: food-other-merged
+  108: building-other-merged
+  109: rock-merged
+  110: crosswalk
+  111: painting
+  112: column
+  113: apparel
+  114: pole
+  115: traffic bollard
+  116: stone pier
+  117: pothole
+  118: occlusion
+  119: escalator

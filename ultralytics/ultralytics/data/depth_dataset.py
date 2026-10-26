@@ -485,6 +485,10 @@ class DepthSegmentDataset(BaseDataset):
         labels = cache["labels"]
         if not labels:
             raise RuntimeError(f"No valid labels found in {cache_path}")
+        # The cached labels replace im_files below, so the fraction must be applied
+        # here as well (BaseDataset.get_labels subsamples im_files before caching).
+        if self.fraction < 1 and len(labels) > 1:
+            labels = labels[: max(1, round(len(labels) * self.fraction))]
         [cache.pop(k, None) for k in ("hash", "version", "msgs")]
         self.im_files = [lb["im_file"] for lb in labels]
         self.depth_files = [lb.get("depth_file", "") for lb in labels]

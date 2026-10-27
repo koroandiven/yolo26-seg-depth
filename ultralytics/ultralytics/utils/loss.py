@@ -1792,6 +1792,12 @@ class DepthSegmentationLoss(v8SegmentationLoss):
         self.sym_weight = sym_weight
         self.head = model.model[-1]  # DepthSegment26 head; stashes depth-path tensors each train forward
         self.model = model  # kept for the L2-SP regularizer
+        # end2end models run inference on the one2one branch, so it must be trained too.
+        # Without this the one2one head keeps its initialization bias (~1e-4 confidence)
+        # and every validation prediction falls below the conf threshold -> mAP stays 0.
+        self.one2one_seg_loss = (
+            v8SegmentationLoss(model, tal_topk=7, tal_topk2=1) if getattr(model, "end2end", False) else None
+        )
         self.depth_loss_fn = MultiScaleDepthLoss(
             scales=(1.0, 0.5),
             edge_weight=0.6,
@@ -1830,6 +1836,11 @@ class DepthSegmentationLoss(v8SegmentationLoss):
         if not self.freeze_seg:
             seg_loss, loss_items = super().loss(seg_preds, batch)
             seg_loss_val = seg_loss.sum()
+            # Also train the one2one branch: for end2end heads this is the branch used at
+            # inference, and it is otherwise never touched by the loss above.
+            if self.one2one_seg_loss is not None and isinstance(preds, dict) and "one2one" in preds:
+                o2o_loss, _ = self.one2one_seg_loss.loss(preds["one2one"], batch)
+                seg_loss_val = seg_loss_val + o2o_loss.sum()
 
         # Depth loss uses original preds (which has depth key)
         device = batch["img"].device

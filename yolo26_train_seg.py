@@ -102,6 +102,47 @@ class ReverseFreezeCallback:
                     f"freeze_backbone={self.freeze_backbone}")
 
 
+class One2OneWarmStart:
+    """Copy the trained one2many weights into the one2one branch at start.
+
+    For end2end heads inference runs on the one2one branch, which the depth
+    criterion only trains with a one-to-one assignment (1 anchor per GT), so it
+    converges much slower than one2many (10 anchors per GT). Seeding one2one with
+    the already-trained one2many gives the inference branch a sane confidence
+    range from the first epoch; the one-to-one loss then refines it.
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.done = False
+
+    def on_train_start(self, trainer):
+        if self.done or not self.enabled:
+            return
+        from ultralytics.utils.torch_utils import unwrap_model
+
+        model = unwrap_model(trainer.model)
+        ema = getattr(trainer, "ema", None)
+        ema_model = getattr(ema, "ema", None) if ema is not None else None
+        copied = 0
+        for target in (model, ema_model):
+            if target is None:
+                continue
+            head = target.model[-1] if hasattr(target, "model") else None
+            if head is None or not getattr(head, "end2end", False):
+                continue
+            pairs = [("cv2", "one2one_cv2"), ("cv3", "one2one_cv3"), ("cv4", "one2one_cv4")]
+            for src_name, dst_name in pairs:
+                src, dst = getattr(head, src_name, None), getattr(head, dst_name, None)
+                if src is None or dst is None:
+                    continue
+                for a, b in zip(src, dst):
+                    b.load_state_dict(a.state_dict())
+                    copied += 1
+        self.done = True
+        LOGGER.info(f"Warm-started {copied} one2one head layers from the trained one2many branch (model + EMA)")
+
+
 def train_seg_only():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="ultralytics/ultralytics/cfg/models/26/yolo26-seg-depth-120c.yaml")
@@ -117,7 +158,8 @@ def train_seg_only():
     p.add_argument("--name",   default="yolo26-seg-120c-stage1")
     p.add_argument("--patience", type=int, default=50)
     p.add_argument("--fliplr", type=float, default=0.5)
-    p.add_argument("--resume", action="store_true")
+    p.add_argument("--resume", nargs="?", const=True, default=False,
+                   help="Resume from a checkpoint path (or from the latest run if no path is given)")
     p.add_argument("--pretrained", type=str, default=None,
                    help="Optional. If given, only backbone+neck are loaded (head reinit). "
                         "Omit to train from scratch.")
@@ -136,6 +178,8 @@ def train_seg_only():
     p.add_argument("--fraction", type=float, default=None,
                    help="Fraction of the training set to use (0-1); 1.0 = all (default). "
                         "Useful for smoke tests / quick convergence checks.")
+    p.add_argument("--no-warm-start", action="store_true",
+                   help="Do not seed the one2one (inference) branch from the trained one2many branch")
     args = p.parse_args()
 
     overrides = {
@@ -159,31 +203,40 @@ def train_seg_only():
     trainer.pretrained_path = None  # disable default loading
     trainer.freeze_depth_epochs = 0
 
-    # Build the model through the trainer so it carries the depth attributes
-    # (depth_weight / sym_weight / freeze_seg / args) that select the multi-task
-    # criterion: with depth_weight missing, the stock 5-item v8SegmentationLoss is
-    # used for training while validation uses the 7-item depth loss -> shape mismatch.
-    model = trainer.get_model(cfg=args.model, weights=None, verbose=True)
-
-    if hasattr(model, "criterion") and model.criterion is not None:
-        model.criterion.freeze_seg = False
-
-    # Load only backbone+neck (avoid class-ID-mismatch in head)
-    if args.pretrained is None:
-        LOGGER.info("Training from scratch (no pretrained weights)")
-    elif not args.load_full_head:
-        LOGGER.info(f"Loading backbone+neck only from {args.pretrained} (head will be reinitialized)")
-        load_backbone_only(model, args.pretrained)
+    if args.resume:
+        # The trainer loads the checkpoint itself (setup_model -> load_checkpoint) and
+        # restores optimizer/scaler/EMA/epoch, so nothing must be pre-built here.
+        LOGGER.info(f"Resuming from {args.model}")
     else:
-        LOGGER.warning("Loading full weights INCLUDING misaligned head — fast but wrong class semantics")
-        ckpt = torch.load(args.pretrained, map_location="cpu", weights_only=False)
-        model.load(ckpt)
+        # Build the model through the trainer so it carries the depth attributes
+        # (depth_weight / sym_weight / freeze_seg / args) that select the multi-task
+        # criterion: with depth_weight missing, the stock 5-item v8SegmentationLoss is
+        # used for training while validation uses the 7-item depth loss -> shape mismatch.
+        model = trainer.get_model(cfg=args.model, weights=None, verbose=True)
 
-    trainer.model = model
+        if hasattr(model, "criterion") and model.criterion is not None:
+            model.criterion.freeze_seg = False
+
+        # Load only backbone+neck (avoid class-ID-mismatch in head)
+        if args.pretrained is None:
+            LOGGER.info("Training from scratch (no pretrained weights)")
+        elif not args.load_full_head:
+            LOGGER.info(f"Loading backbone+neck only from {args.pretrained} (head will be reinitialized)")
+            load_backbone_only(model, args.pretrained)
+        else:
+            LOGGER.warning("Loading full weights INCLUDING misaligned head — fast but wrong class semantics")
+            ckpt = torch.load(args.pretrained, map_location="cpu", weights_only=False)
+            # saved checkpoints are stripped ("model" is None); the EMA copy holds the weights
+            model.load(ckpt.get("ema") or ckpt["model"], verbose=True)
+
+        trainer.model = model
 
     cb = ReverseFreezeCallback(freeze_backbone=args.freeze_backbone)
     trainer.add_callback("on_train_epoch_start", cb.on_train_epoch_start)
     trainer.add_callback("on_train_batch_start", cb.on_train_batch_start)
+
+    warm = One2OneWarmStart(enabled=not args.no_warm_start)
+    trainer.add_callback("on_train_start", warm.on_train_start)
 
     LOGGER.info(f"Reverse training (seg-only): nc=120, depth_weight={args.depth_weight}, "
                 f"freeze_backbone={args.freeze_backbone}, load_full_head={args.load_full_head}")
